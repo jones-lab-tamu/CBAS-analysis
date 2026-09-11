@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE/editor
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Analysis outputs
+MI_Demo_Output/
+outputs/
+
+# Temporary files
+*.tmp
+*.log
+
+# Raw/data files, as an extra safeguard
+*.csv
