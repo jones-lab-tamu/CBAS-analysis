@@ -35,6 +35,10 @@ BEHAVIORS = [
     "grooming",
     "locomotion",
 ]
+RESTING_BEHAVIOR_INDEX = BEHAVIORS.index("resting")
+NONRESTING_BEHAVIOR_INDICES = tuple(
+    index for index, behavior in enumerate(BEHAVIORS) if behavior != "resting"
+)
 
 FRP_HOURS = 24.0
 FILE_DURATION_MINUTES = 10.0
@@ -43,6 +47,7 @@ RANDOM_SEED = 20260911
 PHASE_BIN_COUNTS = (8, 12, 24)
 PRIMARY_PHASE_BINS = 12
 PHASE_ORIGIN_OFFSETS_MINUTES = tuple(range(0, 120, 10))
+DECOMPOSITION_TOLERANCE_BITS = 1e-12
 
 INPUT_DIR = Path(r"C:\Users\Jeff\Documents\CBAS_Analysis_Data")
 OUTPUT_DIR = INPUT_DIR / "MI_Demo_Output"
@@ -156,6 +161,23 @@ def contingency_table(bin_indices: np.ndarray, labels: np.ndarray, n_bins: int) 
         minlength=n_bins * len(BEHAVIORS),
     )
     return flat.reshape(n_bins, len(BEHAVIORS)).astype(np.int64, copy=False)
+
+
+def rest_nonrest_counts(counts: np.ndarray) -> np.ndarray:
+    """Collapse the 9-state behavior axis to resting versus non-resting."""
+
+    resting = np.take(counts, RESTING_BEHAVIOR_INDEX, axis=-1)[..., None]
+    nonresting = np.take(counts, NONRESTING_BEHAVIOR_INDICES, axis=-1).sum(
+        axis=-1,
+        keepdims=True,
+    )
+    return np.concatenate((resting, nonresting), axis=-1)
+
+
+def conditional_nonrest_counts(counts: np.ndarray) -> np.ndarray:
+    """Remove resting without changing phase bins or concatenating samples."""
+
+    return np.take(counts, NONRESTING_BEHAVIOR_INDICES, axis=-1)
 
 
 def mutual_information_bits(counts: np.ndarray) -> float:
@@ -434,6 +456,141 @@ def analyze_observed_and_null(
     return metrics, null_mi, null_nmi
 
 
+def calculate_primary_mi_decomposition(
+    full_observed_counts: np.ndarray,
+    full_null_counts: np.ndarray,
+    full_metrics: dict[str, float],
+    full_null_mi: np.ndarray,
+    complete_sample_count: int,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    """Calculate and validate the 9-state MI decomposition at 12 bins."""
+
+    # The null tables already contain intact 9-state sequences after the
+    # existing circular shifts. Conditioning below therefore happens second.
+    rest_observed_counts = rest_nonrest_counts(full_observed_counts)
+    rest_null_counts = rest_nonrest_counts(full_null_counts)
+    conditional_observed_counts = conditional_nonrest_counts(full_observed_counts)
+    conditional_null_counts = conditional_nonrest_counts(full_null_counts)
+
+    rest_metrics, rest_null_mi, _ = analyze_observed_and_null(
+        rest_observed_counts,
+        rest_null_counts,
+        expected_sample_count=complete_sample_count,
+    )
+    nonrest_sample_count = int(conditional_observed_counts.sum())
+    conditional_metrics, conditional_null_mi, _ = analyze_observed_and_null(
+        conditional_observed_counts,
+        conditional_null_counts,
+        expected_sample_count=nonrest_sample_count,
+    )
+
+    resting_sample_count = int(rest_observed_counts[:, 0].sum())
+    p_rest = resting_sample_count / complete_sample_count
+    p_nonrest = nonrest_sample_count / complete_sample_count
+    if not np.isclose(p_rest + p_nonrest, 1.0, atol=DECOMPOSITION_TOLERANCE_BITS, rtol=0.0):
+        raise ValueError("P_rest + P_nonrest does not equal 1 within tolerance.")
+
+    if not np.all(rest_null_counts.sum(axis=(1, 2)) == complete_sample_count):
+        raise ValueError("Rest/non-rest null tables changed the complete-cycle sample count.")
+    if not np.all(conditional_null_counts.sum(axis=(1, 2)) == nonrest_sample_count):
+        raise ValueError("Conditional null tables do not preserve the non-rest sample count.")
+
+    observed_reconstructed_mi = (
+        rest_metrics["MI_raw_bits"]
+        + p_nonrest * conditional_metrics["MI_raw_bits"]
+    )
+    observed_decomposition_error = float(
+        full_metrics["MI_raw_bits"] - observed_reconstructed_mi
+    )
+    null_reconstructed_mi = rest_null_mi + p_nonrest * conditional_null_mi
+    null_decomposition_errors = full_null_mi - null_reconstructed_mi
+    maximum_null_decomposition_error = float(
+        np.max(np.abs(null_decomposition_errors))
+    )
+
+    weighted_conditional_excess = (
+        p_nonrest * conditional_metrics["MI_excess_bits"]
+    )
+    reconstructed_excess = (
+        rest_metrics["MI_excess_bits"] + weighted_conditional_excess
+    )
+    excess_decomposition_error = float(
+        full_metrics["MI_excess_bits"] - reconstructed_excess
+    )
+
+    if abs(observed_decomposition_error) > DECOMPOSITION_TOLERANCE_BITS:
+        raise ValueError(
+            "Observed MI decomposition identity exceeded the tolerance: "
+            f"{observed_decomposition_error:.17g} bits."
+        )
+    if maximum_null_decomposition_error > DECOMPOSITION_TOLERANCE_BITS:
+        raise ValueError(
+            "A null MI decomposition identity exceeded the tolerance: "
+            f"{maximum_null_decomposition_error:.17g} bits."
+        )
+    if abs(excess_decomposition_error) > DECOMPOSITION_TOLERANCE_BITS:
+        raise ValueError(
+            "Excess-MI decomposition identity exceeded the tolerance: "
+            f"{excess_decomposition_error:.17g} bits."
+        )
+
+    def component_row(
+        component: str,
+        n_samples: int,
+        n_behavior_states: int,
+        metrics: dict[str, float],
+    ) -> dict[str, float | int | str]:
+        return {
+            "component": component,
+            "n_samples": n_samples,
+            "n_behavior_states": n_behavior_states,
+            "H_behavior_bits": metrics["H_behavior_bits"],
+            "MI_raw_bits": metrics["MI_raw_bits"],
+            "MI_null_mean_bits": metrics["MI_null_mean"],
+            "MI_null_SD_bits": metrics["MI_null_SD"],
+            "MI_excess_bits": metrics["MI_excess_bits"],
+            "MI_z": metrics["MI_z"],
+            "NMI_raw": metrics["NMI_raw"],
+            "NMI_null_mean": metrics["NMI_null_mean"],
+            "NMI_excess": metrics["NMI_excess"],
+        }
+
+    decomposition_frame = pd.DataFrame(
+        [
+            component_row("full_9state", complete_sample_count, len(BEHAVIORS), full_metrics),
+            component_row("rest_vs_nonrest", complete_sample_count, 2, rest_metrics),
+            component_row(
+                "conditional_8state_nonrest",
+                nonrest_sample_count,
+                len(NONRESTING_BEHAVIOR_INDICES),
+                conditional_metrics,
+            ),
+        ]
+    )
+    details = {
+        "p_rest": float(p_rest),
+        "p_nonrest": float(p_nonrest),
+        "n_resting_samples": float(resting_sample_count),
+        "n_nonresting_samples": float(nonrest_sample_count),
+        "observed_9state_mi": float(full_metrics["MI_raw_bits"]),
+        "observed_rest_nonrest_mi": float(rest_metrics["MI_raw_bits"]),
+        "observed_conditional_8state_mi": float(conditional_metrics["MI_raw_bits"]),
+        "weighted_conditional_mi": float(
+            p_nonrest * conditional_metrics["MI_raw_bits"]
+        ),
+        "reconstructed_total_mi": float(observed_reconstructed_mi),
+        "observed_decomposition_error_bits": observed_decomposition_error,
+        "maximum_null_decomposition_error_bits": maximum_null_decomposition_error,
+        "mi9_excess": float(full_metrics["MI_excess_bits"]),
+        "rest_nonrest_excess": float(rest_metrics["MI_excess_bits"]),
+        "conditional_8state_excess": float(conditional_metrics["MI_excess_bits"]),
+        "weighted_conditional_excess": float(weighted_conditional_excess),
+        "reconstructed_excess": float(reconstructed_excess),
+        "excess_decomposition_error_bits": excess_decomposition_error,
+    }
+    return decomposition_frame, details
+
+
 def make_phase_labels(n_bins: int) -> list[str]:
     hours_per_bin = FRP_HOURS / n_bins
     return [
@@ -593,6 +750,56 @@ def save_phase_origin_outputs(
     plt.close(fig)
 
 
+def save_decomposition_plot(
+    decomposition_details: dict[str, float],
+    output_dir: Path,
+) -> None:
+    """Plot the two additive MI contributions and the full 9-state total."""
+
+    contribution_labels = [
+        "I(P; R)",
+        "P(non-rest) * I(P; B8 | non-rest)",
+    ]
+    contributions = [
+        decomposition_details["observed_rest_nonrest_mi"],
+        decomposition_details["weighted_conditional_mi"],
+    ]
+    full_mi = decomposition_details["observed_9state_mi"]
+
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    bars = ax.bar(
+        contribution_labels,
+        contributions,
+        color=["#4c78a8", "#f58518"],
+        width=0.65,
+    )
+    ax.axhline(
+        full_mi,
+        color="#d62728",
+        linestyle="--",
+        linewidth=2,
+        label=f"Full I(P; B9) = {full_mi:.5g} bits",
+    )
+    for bar, value in zip(bars, contributions):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height(),
+            f"{value:.5g}",
+            ha="center",
+            va="bottom",
+        )
+    ax.set_title(
+        "12-bin Phase x Behavior MI decomposition\n"
+        "The second bar is the weighted conditional contribution"
+    )
+    ax.set_ylabel("Mutual information (bits)")
+    ax.legend()
+    ax.grid(axis="y", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(output_dir / "mi_decomposition_12bin.png", dpi=200)
+    plt.close(fig)
+
+
 def write_summary_text(
     path: Path,
     input_count: int,
@@ -608,6 +815,7 @@ def write_summary_text(
     all_available_mi_by_bins: dict[int, float],
     summary_frame: pd.DataFrame,
     phase_origin_sensitivity: pd.DataFrame,
+    decomposition_details: dict[str, float],
 ) -> None:
     """Write the requested human-readable summary."""
 
@@ -642,6 +850,26 @@ def write_summary_text(
         f"H_behavior_bits: {primary['H_behavior_bits']:.12g}",
         f"NMI_raw: {primary['NMI_raw']:.12g}",
         f"NMI_excess: {primary['NMI_excess']:.12g}",
+        "",
+        "Primary 12-bin MI decomposition (bits; NMI values are separate and not additive)",
+        f"P_rest: {decomposition_details['p_rest']:.12g}",
+        f"P_nonrest: {decomposition_details['p_nonrest']:.12g}",
+        f"Resting complete-cycle samples: {decomposition_details['n_resting_samples']:.0f}",
+        f"Non-resting complete-cycle samples: {decomposition_details['n_nonresting_samples']:.0f}",
+        f"Observed 9-state MI: {decomposition_details['observed_9state_mi']:.12g} bits",
+        f"Observed rest/non-rest MI: {decomposition_details['observed_rest_nonrest_mi']:.12g} bits",
+        f"Observed conditional 8-state MI: {decomposition_details['observed_conditional_8state_mi']:.12g} bits",
+        f"Weighted conditional contribution (P_nonrest * conditional 8-state MI): {decomposition_details['weighted_conditional_mi']:.12g} bits",
+        f"Reconstructed total (rest/non-rest MI + weighted conditional MI): {decomposition_details['reconstructed_total_mi']:.12g} bits",
+        f"Observed decomposition error: {decomposition_details['observed_decomposition_error_bits']:.12g} bits",
+        f"Maximum null decomposition error: {decomposition_details['maximum_null_decomposition_error_bits']:.12g} bits",
+        f"9-state MI_excess: {decomposition_details['mi9_excess']:.12g} bits",
+        f"Rest/non-rest MI_excess: {decomposition_details['rest_nonrest_excess']:.12g} bits",
+        f"Conditional 8-state MI_excess: {decomposition_details['conditional_8state_excess']:.12g} bits",
+        f"Weighted conditional excess contribution: {decomposition_details['weighted_conditional_excess']:.12g} bits",
+        f"Reconstructed 9-state MI_excess: {decomposition_details['reconstructed_excess']:.12g} bits",
+        f"Excess decomposition error: {decomposition_details['excess_decomposition_error_bits']:.12g} bits",
+        "NMI for each component is reported separately in mi_decomposition_12bin.csv; no additive NMI decomposition is used.",
         "",
         "Optional descriptive all-available-data raw MI (not corrected by the complete-cycle null)",
     ]
@@ -980,6 +1208,13 @@ def main() -> None:
     primary_null_mi, primary_null_nmi = null_results_by_bins[PRIMARY_PHASE_BINS]
     primary_null_counts = null_tables_by_bins[PRIMARY_PHASE_BINS]
     primary_counts = complete_counts_by_bins[PRIMARY_PHASE_BINS]
+    decomposition_frame, decomposition_details = calculate_primary_mi_decomposition(
+        primary_counts,
+        primary_null_counts,
+        primary_metrics,
+        primary_null_mi,
+        complete_sample_count,
+    )
 
     phase_origin_sensitivity = calculate_phase_origin_sensitivity(
         complete_cycles,
@@ -1011,6 +1246,10 @@ def main() -> None:
             "null_NMI": primary_null_nmi,
         }
     ).to_csv(output_dir / "mi_null_distribution_12bin.csv", index=False)
+    decomposition_frame.to_csv(
+        output_dir / "mi_decomposition_12bin.csv",
+        index=False,
+    )
     save_phase_table(
         primary_counts,
         output_dir / "phase_behavior_counts_12bin.csv",
@@ -1030,6 +1269,7 @@ def main() -> None:
         behavior_counts,
     )
     save_phase_origin_outputs(phase_origin_sensitivity, output_dir)
+    save_decomposition_plot(decomposition_details, output_dir)
     write_summary_text(
         output_dir / "mi_summary.txt",
         input_count=len(input_files),
@@ -1045,45 +1285,7 @@ def main() -> None:
         all_available_mi_by_bins=all_available_mi_by_bins,
         summary_frame=summary_frame,
         phase_origin_sensitivity=phase_origin_sensitivity,
-    )
-
-    new_output_files = [
-        output_dir / "mi_phase_origin_sensitivity.csv",
-        output_dir / "mi_phase_origin_sensitivity.png",
-    ]
-    updated_output_files = [
-        output_dir / "behavior_sequence.csv",
-        output_dir / "mi_summary.csv",
-        output_dir / "mi_null_distribution_12bin.csv",
-        output_dir / "phase_behavior_counts_12bin.csv",
-        output_dir / "phase_behavior_probabilities_12bin.csv",
-        output_dir / "phase_behavior_heatmap_12bin.png",
-        output_dir / "mi_null_distribution_12bin.png",
-        output_dir / "mi_sensitivity.png",
-        output_dir / "behavioral_time_budget.png",
-        output_dir / "mi_summary.txt",
-    ]
-    manual_diff_path = output_dir / "MANUAL_DIFF.txt"
-    validation_checks = [
-        f"PASS: observed and every null contingency table use exactly {complete_sample_count} complete-cycle samples for all width and origin analyses.",
-        f"PASS: {total_valid_samples - complete_sample_count} partial-cycle samples were excluded from MI_excess and retained only in descriptive all-available outputs.",
-        "PASS: the 0-minute phase-origin result matches the standard primary 12-bin result.",
-        "PASS: all 12 phase-origin offsets, including wrap-around offsets, preserve the complete-cycle sample count.",
-        "PASS: the same circular-shift offset matrix and null-generation logic were reused for every phase-origin offset.",
-        "PASS: 8-bin, 12-bin, and 24-bin width sensitivity analyses completed using complete-cycle data.",
-    ]
-    write_manual_diff(
-        manual_diff_path,
-        new_output_files,
-        [*updated_output_files, manual_diff_path],
-        missing_indices,
-        invalid_rows,
-        [cycle_index for cycle_index, _, _ in complete_cycles],
-        complete_sample_count,
-        total_valid_samples,
-        phase_origin_sensitivity,
-        summary_frame,
-        validation_checks,
+        decomposition_details=decomposition_details,
     )
 
     print("Phase x Behavior mutual-information demonstration complete.")
@@ -1096,6 +1298,12 @@ def main() -> None:
         "Phase-origin MI excess range: "
         f"{origin_summary['phase_origin_MI_excess_min']:.8g} to "
         f"{origin_summary['phase_origin_MI_excess_max']:.8g} bits"
+    )
+    print(
+        "MI decomposition errors: "
+        f"observed={decomposition_details['observed_decomposition_error_bits']:.3g}, "
+        f"max_null={decomposition_details['maximum_null_decomposition_error_bits']:.3g}, "
+        f"excess={decomposition_details['excess_decomposition_error_bits']:.3g} bits"
     )
     print(f"Outputs written to: {output_dir}")
 
