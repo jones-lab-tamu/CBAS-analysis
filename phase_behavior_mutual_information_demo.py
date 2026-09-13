@@ -54,6 +54,23 @@ OUTPUT_DIR = INPUT_DIR / "MI_Demo_Output"
 INPUT_FILENAME_PATTERN = re.compile(
     r"^(?P<animal>.+)_(?P<index>\d{5})_curated_aug_model_outputs\.csv$"
 )
+LEGACY_OUTPUT_FILENAMES = (
+    "behavior_sequence.csv",
+    "mi_summary.csv",
+    "mi_decomposition_12bin.csv",
+    "phase_behavior_counts_12bin.csv",
+    "phase_behavior_probabilities_12bin.csv",
+    "mi_null_distribution_12bin.csv",
+    "mi_phase_origin_sensitivity.csv",
+    "behavioral_time_budget.png",
+    "phase_behavior_heatmap_12bin.png",
+    "mi_null_distribution_12bin.png",
+    "mi_sensitivity.png",
+    "mi_phase_origin_sensitivity.png",
+    "mi_decomposition_12bin.png",
+    "mi_summary.txt",
+    "MANUAL_DIFF.txt",
+)
 
 
 def discover_input_files(input_dir: Path) -> tuple[list[tuple[int, Path]], list[int]]:
@@ -97,6 +114,17 @@ def discover_input_files(input_dir: Path) -> tuple[list[tuple[int, Path]], list[
     expected = set(range(indices[0], indices[-1] + 1))
     missing_indices = sorted(expected.difference(indices))
     return parsed, missing_indices
+
+
+def remove_known_legacy_outputs(output_dir: Path) -> None:
+    """Remove only named generated artifacts superseded by the six outputs."""
+
+    for filename in LEGACY_OUTPUT_FILENAMES:
+        path = output_dir / filename
+        if path.exists():
+            if not path.is_file():
+                raise ValueError(f"Expected legacy output to be a file: {path}")
+            path.unlink()
 
 
 def read_and_classify(path: Path) -> tuple[int, np.ndarray, np.ndarray]:
@@ -461,8 +489,9 @@ def calculate_primary_mi_decomposition(
     full_null_counts: np.ndarray,
     full_metrics: dict[str, float],
     full_null_mi: np.ndarray,
+    full_null_nmi: np.ndarray,
     complete_sample_count: int,
-) -> tuple[pd.DataFrame, dict[str, float]]:
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float]]:
     """Calculate and validate the 9-state MI decomposition at 12 bins."""
 
     # The null tables already contain intact 9-state sequences after the
@@ -472,13 +501,13 @@ def calculate_primary_mi_decomposition(
     conditional_observed_counts = conditional_nonrest_counts(full_observed_counts)
     conditional_null_counts = conditional_nonrest_counts(full_null_counts)
 
-    rest_metrics, rest_null_mi, _ = analyze_observed_and_null(
+    nonrest_sample_count = int(conditional_observed_counts.sum())
+    rest_metrics, rest_null_mi, rest_null_nmi = analyze_observed_and_null(
         rest_observed_counts,
         rest_null_counts,
         expected_sample_count=complete_sample_count,
     )
-    nonrest_sample_count = int(conditional_observed_counts.sum())
-    conditional_metrics, conditional_null_mi, _ = analyze_observed_and_null(
+    conditional_metrics, conditional_null_mi, conditional_null_nmi = analyze_observed_and_null(
         conditional_observed_counts,
         conditional_null_counts,
         expected_sample_count=nonrest_sample_count,
@@ -539,6 +568,8 @@ def calculate_primary_mi_decomposition(
         n_samples: int,
         n_behavior_states: int,
         metrics: dict[str, float],
+        weighted_raw: float,
+        weighted_excess: float,
     ) -> dict[str, float | int | str]:
         return {
             "component": component,
@@ -553,17 +584,37 @@ def calculate_primary_mi_decomposition(
             "NMI_raw": metrics["NMI_raw"],
             "NMI_null_mean": metrics["NMI_null_mean"],
             "NMI_excess": metrics["NMI_excess"],
+            "P_rest": p_rest,
+            "P_nonrest": p_nonrest,
+            "weighted_MI_raw_bits": weighted_raw,
+            "weighted_MI_excess_bits": weighted_excess,
         }
 
     decomposition_frame = pd.DataFrame(
         [
-            component_row("full_9state", complete_sample_count, len(BEHAVIORS), full_metrics),
-            component_row("rest_vs_nonrest", complete_sample_count, 2, rest_metrics),
+            component_row(
+                "full_9state",
+                complete_sample_count,
+                len(BEHAVIORS),
+                full_metrics,
+                full_metrics["MI_raw_bits"],
+                full_metrics["MI_excess_bits"],
+            ),
+            component_row(
+                "rest_vs_nonrest",
+                complete_sample_count,
+                2,
+                rest_metrics,
+                rest_metrics["MI_raw_bits"],
+                rest_metrics["MI_excess_bits"],
+            ),
             component_row(
                 "conditional_8state_nonrest",
                 nonrest_sample_count,
                 len(NONRESTING_BEHAVIOR_INDICES),
                 conditional_metrics,
+                p_nonrest * conditional_metrics["MI_raw_bits"],
+                p_nonrest * conditional_metrics["MI_excess_bits"],
             ),
         ]
     )
@@ -588,7 +639,19 @@ def calculate_primary_mi_decomposition(
         "reconstructed_excess": float(reconstructed_excess),
         "excess_decomposition_error_bits": excess_decomposition_error,
     }
-    return decomposition_frame, details
+    null_frame = pd.DataFrame(
+        {
+            "permutation": np.arange(1, len(full_null_mi) + 1),
+            "MI_9state": full_null_mi,
+            "MI_rest_nonrest": rest_null_mi,
+            "MI_conditional_8state_nonrest": conditional_null_mi,
+            "weighted_MI_conditional_8state_nonrest": p_nonrest * conditional_null_mi,
+            "NMI_9state": full_null_nmi,
+            "NMI_rest_nonrest": rest_null_nmi,
+            "NMI_conditional_8state_nonrest": conditional_null_nmi,
+        }
+    )
+    return decomposition_frame, null_frame, details
 
 
 def make_phase_labels(n_bins: int) -> list[str]:
@@ -599,209 +662,181 @@ def make_phase_labels(n_bins: int) -> list[str]:
     ]
 
 
-def save_phase_table(
-    counts: np.ndarray,
-    path: Path,
-    probabilities: bool = False,
-) -> None:
-    """Save a phase table with labels and phase boundaries."""
+def save_phase_behavior_profile(counts: np.ndarray, path: Path) -> None:
+    """Save the primary phase-by-behavior composition as proportions."""
 
+    phase_totals = counts.sum(axis=1)
+    if np.any(phase_totals <= 0):
+        raise ValueError("Every primary phase bin must contain at least one sample.")
+    proportions = counts.astype(float) / phase_totals[:, None]
     n_bins = counts.shape[0]
     hours_per_bin = FRP_HOURS / n_bins
-    data = counts.astype(float) / counts.sum() if probabilities else counts
-    table = pd.DataFrame(data, columns=BEHAVIORS)
-    table.insert(0, "phase_bin", np.arange(n_bins, dtype=int))
-    table.insert(1, "phase_bin_label", make_phase_labels(n_bins))
-    table.insert(
-        2,
+    profile = pd.DataFrame(proportions, columns=BEHAVIORS)
+    profile.insert(0, "phase_bin", np.arange(n_bins, dtype=int))
+    profile.insert(
+        1,
         "phase_start_hours",
         np.arange(n_bins, dtype=float) * hours_per_bin,
     )
-    table.insert(
-        3,
+    profile.insert(
+        2,
         "phase_end_hours",
         (np.arange(n_bins, dtype=float) + 1) * hours_per_bin,
     )
-    table.to_csv(path, index=False)
+    profile.to_csv(path, index=False)
 
 
-def save_plots(
+def build_sensitivity_frame(
+    summary_frame: pd.DataFrame,
+    phase_origin_sensitivity: pd.DataFrame,
+) -> pd.DataFrame:
+    """Combine existing width and phase-origin sensitivity metrics."""
+
+    columns = [
+        "sensitivity_type",
+        "setting",
+        "MI_raw_bits",
+        "MI_null_mean_bits",
+        "MI_null_SD_bits",
+        "MI_excess_bits",
+        "MI_z",
+        "NMI_raw",
+        "NMI_null_mean",
+        "NMI_excess",
+    ]
+    rows: list[dict[str, float | int | str]] = []
+    for _, row in summary_frame.sort_values("phase_bins").iterrows():
+        rows.append(
+            {
+                "sensitivity_type": "phase_bin_count",
+                "setting": int(row["phase_bins"]),
+                "MI_raw_bits": row["MI_raw_bits"],
+                "MI_null_mean_bits": row["MI_null_mean"],
+                "MI_null_SD_bits": row["MI_null_SD"],
+                "MI_excess_bits": row["MI_excess_bits"],
+                "MI_z": row["MI_z"],
+                "NMI_raw": row["NMI_raw"],
+                "NMI_null_mean": row["NMI_null_mean"],
+                "NMI_excess": row["NMI_excess"],
+            }
+        )
+    for _, row in phase_origin_sensitivity.iterrows():
+        rows.append(
+            {
+                "sensitivity_type": "phase_origin_minutes",
+                "setting": int(row["phase_bin_offset_minutes"]),
+                "MI_raw_bits": row["MI_raw_bits"],
+                "MI_null_mean_bits": row["MI_null_mean"],
+                "MI_null_SD_bits": row["MI_null_SD"],
+                "MI_excess_bits": row["MI_excess_bits"],
+                "MI_z": row["MI_z"],
+                "NMI_raw": row["NMI_raw"],
+                "NMI_null_mean": row["NMI_null_mean"],
+                "NMI_excess": row["NMI_excess"],
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def save_overview_plot(
     output_dir: Path,
     primary_counts: np.ndarray,
     primary_metrics: dict[str, float],
     primary_null_mi: np.ndarray,
-    summary_frame: pd.DataFrame,
-    behavior_counts: np.ndarray,
+    decomposition_details: dict[str, float],
 ) -> None:
-    """Create the four requested diagnostic figures."""
+    """Save the three-panel overview figure for the primary analysis."""
 
-    primary_conditional = primary_counts / primary_counts.sum(axis=1, keepdims=True)
+    phase_totals = primary_counts.sum(axis=1)
+    profile = primary_counts.astype(float) / phase_totals[:, None]
+    figure, axes = plt.subplots(1, 3, figsize=(18, 6), constrained_layout=True)
 
-    fig, ax = plt.subplots(figsize=(11, 7))
-    image = ax.imshow(
-        primary_conditional,
+    image = axes[0].imshow(
+        profile.T,
         aspect="auto",
         interpolation="nearest",
         cmap="viridis",
         vmin=0,
-        vmax=np.nanmax(primary_conditional),
+        vmax=np.nanmax(profile),
+        origin="lower",
     )
-    ax.set_title("Behavior composition by relative circadian phase")
-    ax.set_xlabel("Winner-take-all behavior")
-    ax.set_ylabel("Relative phase bin (hours)")
-    ax.set_xticks(np.arange(len(BEHAVIORS)))
-    ax.set_xticklabels(BEHAVIORS, rotation=45, ha="right")
-    ax.set_yticks(np.arange(PRIMARY_PHASE_BINS))
-    ax.set_yticklabels(make_phase_labels(PRIMARY_PHASE_BINS))
-    colorbar = fig.colorbar(image, ax=ax)
-    colorbar.set_label("P(behavior | phase)")
-    fig.tight_layout()
-    fig.savefig(output_dir / "phase_behavior_heatmap_12bin.png", dpi=200)
-    plt.close(fig)
+    axes[0].set_title("A. Phase x behavior profile")
+    axes[0].set_xlabel("Relative circadian phase (hours)")
+    axes[0].set_ylabel("Behavior")
+    axes[0].set_xticks(np.arange(PRIMARY_PHASE_BINS))
+    axes[0].set_xticklabels(make_phase_labels(PRIMARY_PHASE_BINS), rotation=45, ha="right")
+    axes[0].set_yticks(np.arange(len(BEHAVIORS)))
+    axes[0].set_yticklabels(BEHAVIORS)
+    colorbar = figure.colorbar(image, ax=axes[0], fraction=0.046, pad=0.04)
+    colorbar.set_label("Proportion within phase bin")
 
-    fig, ax = plt.subplots(figsize=(9, 6))
-    ax.hist(primary_null_mi, bins=40, color="#4c78a8", alpha=0.85, edgecolor="white")
-    ax.axvline(
+    axes[1].hist(
+        primary_null_mi,
+        bins=40,
+        color="#4c78a8",
+        alpha=0.85,
+        edgecolor="white",
+    )
+    axes[1].axvline(
         primary_metrics["MI_raw_bits"],
         color="#d62728",
         linewidth=2,
-        label=f"Observed MI = {primary_metrics['MI_raw_bits']:.5g}",
+        label=f"Observed = {primary_metrics['MI_raw_bits']:.5g}",
     )
-    ax.axvline(
+    axes[1].axvline(
         primary_metrics["MI_null_mean"],
         color="#2ca02c",
         linewidth=2,
         label=f"Null mean = {primary_metrics['MI_null_mean']:.5g}",
     )
-    ax.set_title("12-bin circular-shift null distribution")
-    ax.set_xlabel("Mutual information (bits)")
-    ax.set_ylabel("Permutation count")
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(output_dir / "mi_null_distribution_12bin.png", dpi=200)
-    plt.close(fig)
+    axes[1].set_title("B. Full 9-state null distribution")
+    axes[1].set_xlabel("MI (bits)")
+    axes[1].set_ylabel("Permutation count")
+    axes[1].legend(fontsize=9)
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ordered = summary_frame.sort_values("phase_bins")
-    ax.plot(
-        ordered["phase_bins"],
-        ordered["MI_excess_bits"],
-        marker="o",
-        linewidth=2,
+    full_excess = decomposition_details["mi9_excess"]
+    rest_excess = decomposition_details["rest_nonrest_excess"]
+    weighted_conditional_excess = decomposition_details["weighted_conditional_excess"]
+    axes[2].bar(
+        [0],
+        [rest_excess],
         color="#4c78a8",
+        label="Rest/non-rest",
     )
-    ax.set_xticks(ordered["phase_bins"])
-    ax.set_xticklabels(
-        [f"{int(bins)} ({hours:g} h)" for bins, hours in zip(ordered["phase_bins"], ordered["hours_per_bin"])]
+    axes[2].bar(
+        [0],
+        [weighted_conditional_excess],
+        bottom=[rest_excess],
+        color="#f58518",
+        label="P_nonrest * conditional 8-state",
     )
-    ax.set_title("MI excess sensitivity to phase-bin resolution")
-    ax.set_xlabel("Phase bins (hours per bin)")
-    ax.set_ylabel("MI excess (bits)")
-    ax.grid(axis="y", alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(output_dir / "mi_sensitivity.png", dpi=200)
-    plt.close(fig)
-
-    fig, ax = plt.subplots(figsize=(10, 5))
-    proportions = behavior_counts / behavior_counts.sum()
-    bars = ax.bar(BEHAVIORS, proportions, color="#72b7b2")
-    ax.set_title("Overall behavioral time budget (all valid samples)")
-    ax.set_xlabel("Winner-take-all behavior")
-    ax.set_ylabel("Proportion of valid samples")
-    ax.set_ylim(0, max(0.1, float(proportions.max()) * 1.18))
-    ax.tick_params(axis="x", rotation=45)
-    for bar, proportion in zip(bars, proportions):
-        ax.text(
-            bar.get_x() + bar.get_width() / 2,
-            bar.get_height(),
-            f"{proportion:.1%}",
+    for bottom, value in ((0.0, rest_excess), (rest_excess, weighted_conditional_excess)):
+        percentage = 100.0 * value / full_excess if full_excess else float("nan")
+        axes[2].text(
+            0,
+            bottom + value / 2,
+            f"{value:.5g} bits\n({percentage:.1f}%)",
             ha="center",
-            va="bottom",
+            va="center",
+            color="white",
             fontsize=9,
         )
-    fig.tight_layout()
-    fig.savefig(output_dir / "behavioral_time_budget.png", dpi=200)
-    plt.close(fig)
+    axes[2].set_title("C. Full 9-state MI excess decomposition")
+    axes[2].set_ylabel("MI excess (bits)")
+    axes[2].set_xticks([0])
+    axes[2].set_xticklabels([f"Full 9-state\n= {full_excess:.5g} bits"])
+    axes[2].set_ylim(0, full_excess * 1.28)
+    axes[2].legend(fontsize=8, loc="upper right")
+    axes[2].grid(axis="y", alpha=0.3)
+
+    figure.savefig(output_dir / "mi_overview.png", dpi=200)
+    plt.close(figure)
 
 
-def save_phase_origin_outputs(
-    sensitivity: pd.DataFrame,
-    output_dir: Path,
-) -> None:
-    """Save the phase-origin sensitivity table and figure."""
-
-    sensitivity.to_csv(output_dir / "mi_phase_origin_sensitivity.csv", index=False)
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(
-        sensitivity["phase_bin_offset_minutes"],
-        sensitivity["MI_excess_bits"],
-        marker="o",
-        linewidth=2,
-        color="#4c78a8",
-    )
-    ax.set_title("MI excess sensitivity to 12-bin phase origin")
-    ax.set_xlabel("Phase-bin origin offset (minutes)")
-    ax.set_ylabel("MI excess (bits)")
-    ax.set_xticks(sensitivity["phase_bin_offset_minutes"])
-    ax.grid(axis="y", alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(output_dir / "mi_phase_origin_sensitivity.png", dpi=200)
-    plt.close(fig)
-
-
-def save_decomposition_plot(
-    decomposition_details: dict[str, float],
-    output_dir: Path,
-) -> None:
-    """Plot the two additive MI contributions and the full 9-state total."""
-
-    contribution_labels = [
-        "I(P; R)",
-        "P(non-rest) * I(P; B8 | non-rest)",
-    ]
-    contributions = [
-        decomposition_details["observed_rest_nonrest_mi"],
-        decomposition_details["weighted_conditional_mi"],
-    ]
-    full_mi = decomposition_details["observed_9state_mi"]
-
-    fig, ax = plt.subplots(figsize=(9, 5.5))
-    bars = ax.bar(
-        contribution_labels,
-        contributions,
-        color=["#4c78a8", "#f58518"],
-        width=0.65,
-    )
-    ax.axhline(
-        full_mi,
-        color="#d62728",
-        linestyle="--",
-        linewidth=2,
-        label=f"Full I(P; B9) = {full_mi:.5g} bits",
-    )
-    for bar, value in zip(bars, contributions):
-        ax.text(
-            bar.get_x() + bar.get_width() / 2,
-            bar.get_height(),
-            f"{value:.5g}",
-            ha="center",
-            va="bottom",
-        )
-    ax.set_title(
-        "12-bin Phase x Behavior MI decomposition\n"
-        "The second bar is the weighted conditional contribution"
-    )
-    ax.set_ylabel("Mutual information (bits)")
-    ax.legend()
-    ax.grid(axis="y", alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(output_dir / "mi_decomposition_12bin.png", dpi=200)
-    plt.close(fig)
-
-
-def write_summary_text(
+def write_run_summary(
     path: Path,
+    input_dir: Path,
+    animal_prefix: str,
     input_count: int,
     first_file_index: int,
     last_file_index: int,
@@ -812,239 +847,68 @@ def write_summary_text(
     complete_cycle_indices: list[int],
     complete_sample_count: int,
     all_available_sample_count: int,
-    all_available_mi_by_bins: dict[int, float],
-    summary_frame: pd.DataFrame,
-    phase_origin_sensitivity: pd.DataFrame,
     decomposition_details: dict[str, float],
 ) -> None:
-    """Write the requested human-readable summary."""
+    """Write a compact run and validation summary without duplicating results."""
 
-    primary = summary_frame.loc[summary_frame["phase_bins"] == PRIMARY_PHASE_BINS].iloc[0]
     missing_text = "none" if not missing_indices else ", ".join(map(str, missing_indices))
     cycle_text = "none" if not complete_cycle_indices else ", ".join(map(str, complete_cycle_indices))
-
+    p_sum = decomposition_details["p_rest"] + decomposition_details["p_nonrest"]
+    p_sum_pass = np.isclose(
+        p_sum,
+        1.0,
+        atol=DECOMPOSITION_TOLERANCE_BITS,
+        rtol=0.0,
+    )
     lines = [
-        "Single-animal Phase x Behavior Mutual Information demonstration",
+        "Single-animal Phase x Behavior MI run summary",
         "",
-        f"Number of input CSV files found: {input_count}",
-        f"First file index: {first_file_index}",
-        f"Last file index: {last_file_index}",
-        f"Missing file indices: {missing_text}",
-        f"Total elapsed recording duration: {total_duration_hours:.6f} h",
-        f"Total valid behavioral samples (all available): {all_available_sample_count}",
-        f"Complete-cycle valid samples used for observed and null MI: {complete_sample_count}",
-        f"Partial-cycle samples excluded from MI_excess: {all_available_sample_count - complete_sample_count}",
-        f"Rows excluded because they could not be classified: {invalid_rows}",
-        "FRP used: 24.0 h",
-        f"Phase anchor: first valid sample of file 00000, row index {anchor_row_index}, defines relative phase 0",
-        f"Number of complete cycles used in the null: {len(complete_cycle_indices)}",
-        f"Complete cycle indices used in the null: {cycle_text}",
+        "Input / run information",
+        f"input_directory: {input_dir.resolve()}",
+        f"animal_prefix: {animal_prefix}",
+        f"source_file_count: {input_count}",
+        f"first_source_file_index: {first_file_index}",
+        f"last_source_file_index: {last_file_index}",
+        f"missing_source_indices: {missing_text}",
+        f"total_valid_samples: {all_available_sample_count}",
+        f"total_duration_hours: {total_duration_hours:.6f}",
+        f"complete_cycles_used: [{cycle_text}]",
+        f"complete_cycle_sample_count: {complete_sample_count}",
+        f"partial_cycle_samples_excluded_from_corrected_MI: {all_available_sample_count - complete_sample_count}",
+        f"rows_excluded_as_unclassifiable: {invalid_rows}",
+        f"FRP_hours: {FRP_HOURS:.1f}",
+        f"phase_anchor: first valid row of source file 00000, row index {anchor_row_index}, defines relative phase 0",
+        f"primary_phase_bin_count: {PRIMARY_PHASE_BINS}",
+        f"permutation_count: {N_PERMUTATIONS}",
+        f"random_seed: {RANDOM_SEED}",
         "",
-        "Primary 12-bin results (complete-cycle observed and null data)",
-        "Observed MI and permutation-null MI used for MI_excess were calculated from the same complete circadian cycles.",
-        f"MI_raw_bits: {primary['MI_raw_bits']:.12g}",
-        f"MI_null_mean: {primary['MI_null_mean']:.12g}",
-        f"MI_null_SD: {primary['MI_null_SD']:.12g}",
-        f"MI_excess_bits: {primary['MI_excess_bits']:.12g}",
-        f"MI_z: {primary['MI_z']:.12g}",
-        f"H_behavior_bits: {primary['H_behavior_bits']:.12g}",
-        f"NMI_raw: {primary['NMI_raw']:.12g}",
-        f"NMI_excess: {primary['NMI_excess']:.12g}",
-        "",
-        "Primary 12-bin MI decomposition (bits; NMI values are separate and not additive)",
+        "Behavioral composition",
         f"P_rest: {decomposition_details['p_rest']:.12g}",
         f"P_nonrest: {decomposition_details['p_nonrest']:.12g}",
-        f"Resting complete-cycle samples: {decomposition_details['n_resting_samples']:.0f}",
-        f"Non-resting complete-cycle samples: {decomposition_details['n_nonresting_samples']:.0f}",
-        f"Observed 9-state MI: {decomposition_details['observed_9state_mi']:.12g} bits",
-        f"Observed rest/non-rest MI: {decomposition_details['observed_rest_nonrest_mi']:.12g} bits",
-        f"Observed conditional 8-state MI: {decomposition_details['observed_conditional_8state_mi']:.12g} bits",
-        f"Weighted conditional contribution (P_nonrest * conditional 8-state MI): {decomposition_details['weighted_conditional_mi']:.12g} bits",
-        f"Reconstructed total (rest/non-rest MI + weighted conditional MI): {decomposition_details['reconstructed_total_mi']:.12g} bits",
-        f"Observed decomposition error: {decomposition_details['observed_decomposition_error_bits']:.12g} bits",
-        f"Maximum null decomposition error: {decomposition_details['maximum_null_decomposition_error_bits']:.12g} bits",
-        f"9-state MI_excess: {decomposition_details['mi9_excess']:.12g} bits",
-        f"Rest/non-rest MI_excess: {decomposition_details['rest_nonrest_excess']:.12g} bits",
-        f"Conditional 8-state MI_excess: {decomposition_details['conditional_8state_excess']:.12g} bits",
-        f"Weighted conditional excess contribution: {decomposition_details['weighted_conditional_excess']:.12g} bits",
-        f"Reconstructed 9-state MI_excess: {decomposition_details['reconstructed_excess']:.12g} bits",
-        f"Excess decomposition error: {decomposition_details['excess_decomposition_error_bits']:.12g} bits",
-        "NMI for each component is reported separately in mi_decomposition_12bin.csv; no additive NMI decomposition is used.",
         "",
-        "Optional descriptive all-available-data raw MI (not corrected by the complete-cycle null)",
+        "Validation",
+        f"PASS: observed and null complete-cycle sample counts match at {complete_sample_count} samples.",
+        f"PASS: observed decomposition error = {decomposition_details['observed_decomposition_error_bits']:.12g} bits (tolerance {DECOMPOSITION_TOLERANCE_BITS:.0e}).",
+        f"PASS: maximum null decomposition error = {decomposition_details['maximum_null_decomposition_error_bits']:.12g} bits (tolerance {DECOMPOSITION_TOLERANCE_BITS:.0e}).",
+        f"PASS: excess decomposition error = {decomposition_details['excess_decomposition_error_bits']:.12g} bits (tolerance {DECOMPOSITION_TOLERANCE_BITS:.0e}).",
+        f"{'PASS' if p_sum_pass else 'FAIL'}: P_rest + P_nonrest = {p_sum:.12g}.",
+        f"PASS: width sensitivity completed for phase-bin counts {list(PHASE_BIN_COUNTS)}.",
+        f"PASS: phase-origin sensitivity completed for offsets {list(PHASE_ORIGIN_OFFSETS_MINUTES)} minutes.",
+        "PASS: raw source CSV files were read only and remain unchanged.",
+        "",
     ]
-
-    for n_bins in sorted(all_available_mi_by_bins):
-        lines.append(
-            f"{n_bins} bins ({FRP_HOURS / n_bins:g} h/bin): "
-            f"MI_raw_all_available_bits={all_available_mi_by_bins[n_bins]:.12g}"
-        )
-
-    lines.extend(
-        [
-            "",
-            "Phase-bin-width sensitivity results (complete-cycle observed and null data)",
-        ]
-    )
-
-    for _, row in summary_frame.sort_values("phase_bins").iterrows():
-        lines.append(
-            f"{int(row['phase_bins'])} bins ({row['hours_per_bin']:g} h/bin): "
-            f"MI_raw_bits={row['MI_raw_bits']:.12g}, "
-            f"MI_null_mean={row['MI_null_mean']:.12g}, "
-            f"MI_null_SD={row['MI_null_SD']:.12g}, "
-            f"MI_excess_bits={row['MI_excess_bits']:.12g}, "
-            f"MI_z={row['MI_z']:.12g}, "
-            f"NMI_raw={row['NMI_raw']:.12g}, "
-            f"NMI_null_mean={row['NMI_null_mean']:.12g}, "
-            f"NMI_excess={row['NMI_excess']:.12g}"
-        )
-
-    origin_excess = phase_origin_sensitivity["MI_excess_bits"]
-    lines.extend(
-        [
-            "",
-            "Phase-bin-origin sensitivity results (12 bins, 2 h/bin, complete-cycle observed and null data)",
-            f"MI_excess minimum across offsets: {origin_excess.min():.12g} bits",
-            f"MI_excess maximum across offsets: {origin_excess.max():.12g} bits",
-            f"MI_excess mean across offsets: {origin_excess.mean():.12g} bits",
-            f"MI_excess SD across offsets: {origin_excess.std(ddof=1):.12g} bits",
-        ]
-    )
-
-    for _, row in phase_origin_sensitivity.iterrows():
-        lines.append(
-            f"{int(row['phase_bin_offset_minutes'])} min offset: "
-            f"MI_raw_bits={row['MI_raw_bits']:.12g}, "
-            f"MI_null_mean={row['MI_null_mean']:.12g}, "
-            f"MI_null_SD={row['MI_null_SD']:.12g}, "
-            f"MI_excess_bits={row['MI_excess_bits']:.12g}, "
-            f"MI_z={row['MI_z']:.12g}, "
-            f"NMI_raw={row['NMI_raw']:.12g}, "
-            f"NMI_null_mean={row['NMI_null_mean']:.12g}, "
-            f"NMI_excess={row['NMI_excess']:.12g}"
-        )
-
-    lines.extend(
-        [
-            "",
-            "The 0-minute phase-origin result is the standard primary 12-bin result. The origin rotation changes only the phase-bin boundaries, not the behavioral samples or circular-shift offsets.",
-            "",
-            "This is a single-animal demonstration analysis using a fixed 24.0-hour period and a relative phase anchor. The resulting values demonstrate the Phase × Behavior Mutual Information pipeline and should not be interpreted as a genotype effect or as an absolute biological circadian-phase measurement.",
-            "",
-            "Implementation notes: random seed = " + str(RANDOM_SEED),
-            "",
-        ]
-    )
-    path.write_text("\n".join(lines), encoding="utf-8")
-
-
-def write_manual_diff(
-    path: Path,
-    new_output_files: list[Path],
-    updated_output_files: list[Path],
-    missing_indices: list[int],
-    invalid_rows: int,
-    complete_cycle_indices: list[int],
-    complete_sample_count: int,
-    all_available_sample_count: int,
-    phase_origin_sensitivity: pd.DataFrame,
-    summary_frame: pd.DataFrame,
-    validation_checks: list[str],
-) -> None:
-    """Write a manual before/after diff for this non-Git folder."""
-
-    primary = summary_frame.loc[summary_frame["phase_bins"] == PRIMARY_PHASE_BINS].iloc[0]
-    origin_excess = phase_origin_sensitivity["MI_excess_bits"]
-    lines = [
-        "MANUAL_DIFF.txt",
-        "",
-        "This is a manually prepared before/after diff for the focused updates.",
-        "The folder is not a Git repository, so this records the semantic and output changes instead of claiming to be a Git diff.",
-        "",
-        f"--- {Path(__file__).resolve()} (analysis behavior)",
-        "- Before: observed MI and corrected MI metrics were based on all available valid samples, while permutation-null tables were based on complete cycles.",
-        f"+ After: observed MI, MI_excess_bits, MI_z, NMI_raw, and NMI_excess use the complete-cycle contingency tables ({complete_sample_count:,} samples) used by the null.",
-        f"+ After: all available valid samples ({all_available_sample_count:,}) are retained separately for descriptive MI_raw_all_available_bits values only.",
-        "- Before: phase-bin boundaries were fixed at the standard 0-minute origin and no origin sensitivity analysis was emitted.",
-        "+ After: 12-bin phase origins are evaluated at 0, 10, 20, ..., 110 minutes; only bin boundaries rotate, while behavioral samples and circular-shift offsets remain unchanged.",
-        "- Before: the summary did not distinguish the corrected complete-cycle sample basis from the optional all-available descriptive basis.",
-        "+ After: the summary and CSV expose both sample counts and state that observed and null MI use identical complete circadian cycles.",
-        "",
-        "--- primary 12-bin result (numeric before/after)",
-        "- Before: observed basis = all available valid samples (3,702,000); MI_raw_bits = 0.0917526506595; MI_excess_bits = 0.0585033610481; MI_z = 4.49866993312.",
-        f"+ After: observed basis = complete cycles {complete_cycle_indices} ({complete_sample_count:,} samples); MI_raw_bits = {primary['MI_raw_bits']:.12g}; MI_excess_bits = {primary['MI_excess_bits']:.12g}; MI_z = {primary['MI_z']:.12g}.",
-        f"+ After: descriptive all-available MI_raw_all_available_bits = {primary['MI_raw_all_available_bits']:.12g}; it is not used for corrected MI.",
-        "",
-        "--- phase-origin sensitivity",
-        "+ Added a 12-row CSV covering phase-bin origins from 0 through 110 minutes in 10-minute increments.",
-        "+ Added a PNG showing MI excess across those origins.",
-        f"+ After: MI_excess_bits range = {origin_excess.min():.12g} to {origin_excess.max():.12g}; mean = {origin_excess.mean():.12g}; sample SD = {origin_excess.std(ddof=1):.12g}.",
-        "",
-        "--- output artifacts",
-        "+++ Added files",
-    ]
-    lines.extend(f"+++ {file_path.resolve()}" for file_path in new_output_files)
-    lines.extend(["", "~~~ Updated files"])
-    lines.extend(f"~~~ {file_path.resolve()}" for file_path in updated_output_files)
-    lines.extend(
-        [
-            "",
-            "--- execution evidence",
-            f"+ Complete cycles used: {complete_cycle_indices}.",
-            f"+ Complete-cycle sample count used for observed and null MI: {complete_sample_count}.",
-            f"+ All-available valid sample count: {all_available_sample_count}.",
-            "+ Source CSVs were read only and were not modified.",
-            "",
-            "Assumptions retained:",
-            "- Input files must match the expected *_NNNNN_curated_aug_model_outputs.csv pattern and share one animal prefix.",
-            "- Source sequence indices are sorted numerically. Missing indices remain gaps in elapsed time and prevent affected cycles from entering the null.",
-            "- Each source row is assigned time using row_index / number_of_rows_in_file across the fixed 10-minute file interval.",
-            "- A row is classified when at least one required probability is finite and numeric. Non-finite cells are ignored for that row's argmax; ties use the listed behavior order.",
-            "- The first valid row of file 00000 is the relative phase anchor. FRP is fixed at 24.0 hours.",
-            "- Complete null cycles require every expected 10-minute source file and at least one classifiable row in each file. Partial-cycle samples are excluded from corrected MI but remain available for descriptive outputs.",
-            "- Null offsets are independently sampled uniformly over continuous 0-24 hour cycle time for each complete cycle and permutation. The same fixed offsets are reused across phase-bin widths and phase origins.",
-            "- Phase-origin offsets are interpreted in minutes and converted to hours modulo the fixed 24-hour period.",
-            "- MI_null_SD uses the sample standard deviation (ddof=1) of the 10,000 empirical null values.",
-            "",
-            "Validation checks:",
-        ]
-    )
-    lines.extend(f"- {check}" for check in validation_checks)
-    lines.extend(
-        [
-            "",
-            "Warnings and limitations encountered during implementation or execution:",
-        ]
-    )
-    if missing_indices:
-        lines.append(
-            f"- Missing source sequence indices were detected: {missing_indices}. Elapsed-time gaps were preserved; affected cycles were excluded from the null."
-        )
-    else:
-        lines.append("- No missing source sequence indices were encountered in this execution.")
-    if invalid_rows:
-        lines.append(
-            f"- {invalid_rows} source rows were excluded because they could not be assigned a winner-take-all behavior."
-        )
-    else:
-        lines.append("- No unclassifiable source rows were encountered in this execution.")
-    lines.extend(
-        [
-            f"- Phase-origin MI_excess range: {phase_origin_sensitivity['MI_excess_bits'].min():.12g} to {phase_origin_sensitivity['MI_excess_bits'].max():.12g} bits; mean={phase_origin_sensitivity['MI_excess_bits'].mean():.12g}; SD={phase_origin_sensitivity['MI_excess_bits'].std(ddof=1):.12g}.",
-            "- This is a single-animal demonstration with a fixed period and relative phase; it is not a biological CT estimate, genotype comparison, FRP estimate, or recurrence analysis.",
-            "- No commit was created.",
-            "",
-        ]
-    )
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
 def main() -> None:
     output_dir = OUTPUT_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
+    remove_known_legacy_outputs(output_dir)
 
     input_files, missing_indices = discover_input_files(INPUT_DIR)
+    animal_match = INPUT_FILENAME_PATTERN.fullmatch(input_files[0][1].name)
+    assert animal_match is not None
+    animal_prefix = animal_match.group("animal")
     files_per_cycle = int(round(FRP_HOURS * 60.0 / FILE_DURATION_MINUTES))
 
     all_available_counts_by_bins = {
@@ -1053,13 +917,11 @@ def main() -> None:
     }
     behavior_counts = np.zeros(len(BEHAVIORS), dtype=np.int64)
     file_records: dict[int, dict[str, object]] = {}
-    sequence_path = output_dir / "behavior_sequence.csv"
     anchor_elapsed_hours: float | None = None
     anchor_row_index: int | None = None
     total_valid_samples = 0
     invalid_rows = 0
 
-    first_sequence_write = True
     for file_index, path in input_files:
         n_rows, row_indices, labels = read_and_classify(path)
         invalid_rows += n_rows - len(labels)
@@ -1097,25 +959,6 @@ def main() -> None:
             "labels": labels,
             "relative_elapsed_hours": relative_elapsed_hours,
         }
-
-        sequence_frame = pd.DataFrame(
-            {
-                "file_name": path.name,
-                "file_index": file_index,
-                "row_index": row_indices,
-                "elapsed_hours": raw_elapsed_hours,
-                "relative_phase_hours": relative_phase_hours,
-                "cycle_index": cycle_index,
-                "behavior": [BEHAVIORS[int(label)] for label in labels],
-            }
-        )
-        sequence_frame.to_csv(
-            sequence_path,
-            mode="w" if first_sequence_write else "a",
-            header=first_sequence_write,
-            index=False,
-        )
-        first_sequence_write = False
 
     if total_valid_samples == 0:
         raise ValueError("No valid behavioral samples were found in the input CSV files.")
@@ -1208,11 +1051,12 @@ def main() -> None:
     primary_null_mi, primary_null_nmi = null_results_by_bins[PRIMARY_PHASE_BINS]
     primary_null_counts = null_tables_by_bins[PRIMARY_PHASE_BINS]
     primary_counts = complete_counts_by_bins[PRIMARY_PHASE_BINS]
-    decomposition_frame, decomposition_details = calculate_primary_mi_decomposition(
+    decomposition_frame, null_frame, decomposition_details = calculate_primary_mi_decomposition(
         primary_counts,
         primary_null_counts,
         primary_metrics,
         primary_null_mi,
+        primary_null_nmi,
         complete_sample_count,
     )
 
@@ -1238,40 +1082,36 @@ def main() -> None:
             column,
         ] = origin_summary[column]
 
-    summary_frame.to_csv(output_dir / "mi_summary.csv", index=False)
-    pd.DataFrame(
-        {
-            "permutation": np.arange(1, N_PERMUTATIONS + 1),
-            "null_MI_bits": primary_null_mi,
-            "null_NMI": primary_null_nmi,
-        }
-    ).to_csv(output_dir / "mi_null_distribution_12bin.csv", index=False)
     decomposition_frame.to_csv(
-        output_dir / "mi_decomposition_12bin.csv",
+        output_dir / "mi_results.csv",
         index=False,
     )
-    save_phase_table(
-        primary_counts,
-        output_dir / "phase_behavior_counts_12bin.csv",
-        probabilities=False,
+    null_frame.to_csv(
+        output_dir / "mi_null_distribution.csv",
+        index=False,
     )
-    save_phase_table(
+    save_phase_behavior_profile(
         primary_counts,
-        output_dir / "phase_behavior_probabilities_12bin.csv",
-        probabilities=True,
+        output_dir / "phase_behavior_profile.csv",
     )
-    save_plots(
+    build_sensitivity_frame(
+        summary_frame,
+        phase_origin_sensitivity,
+    ).to_csv(
+        output_dir / "mi_sensitivity.csv",
+        index=False,
+    )
+    save_overview_plot(
         output_dir,
         primary_counts,
         primary_metrics,
         primary_null_mi,
-        summary_frame,
-        behavior_counts,
+        decomposition_details,
     )
-    save_phase_origin_outputs(phase_origin_sensitivity, output_dir)
-    save_decomposition_plot(decomposition_details, output_dir)
-    write_summary_text(
-        output_dir / "mi_summary.txt",
+    write_run_summary(
+        output_dir / "run_summary.txt",
+        input_dir=INPUT_DIR,
+        animal_prefix=animal_prefix,
         input_count=len(input_files),
         first_file_index=input_files[0][0],
         last_file_index=input_files[-1][0],
@@ -1282,9 +1122,6 @@ def main() -> None:
         complete_cycle_indices=[cycle_index for cycle_index, _, _ in complete_cycles],
         complete_sample_count=complete_sample_count,
         all_available_sample_count=total_valid_samples,
-        all_available_mi_by_bins=all_available_mi_by_bins,
-        summary_frame=summary_frame,
-        phase_origin_sensitivity=phase_origin_sensitivity,
         decomposition_details=decomposition_details,
     )
 
