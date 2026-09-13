@@ -1,17 +1,18 @@
-"""Single-animal Phase x Behavior mutual-information demonstration.
+"""Single-animal Phase x Behavior mutual-information analysis.
 
-This script reads the CBAS model-output CSV files in ``CBAS_Data``, assigns a
-winner-take-all behavior to each classifiable row, reconstructs elapsed time,
-and writes the requested MI tables, null distribution, plots, and text
-summary to ``CBAS_Data\\MI_Demo_Output``.
+This script reads one animal's CBAS model-output CSV files from a command-line
+input directory, assigns a winner-take-all behavior to each classifiable row,
+reconstructs elapsed time, and writes the requested MI tables, null
+distribution, plot, and text summary to ``<input_dir>\\MI_Output``.
 
-The analysis is intentionally a focused demonstration. It uses a fixed
-24-hour period and a relative phase anchor; it does not assign biological CT
-or perform any genotype or recurrence analysis.
+The analysis is intentionally single-animal and focused. It uses a runtime
+free-running period and a relative phase anchor; it does not assign biological
+CT or perform any genotype or recurrence analysis.
 """
 
 from __future__ import annotations
 
+import argparse
 import re
 from pathlib import Path
 
@@ -40,7 +41,7 @@ NONRESTING_BEHAVIOR_INDICES = tuple(
     index for index, behavior in enumerate(BEHAVIORS) if behavior != "resting"
 )
 
-FRP_HOURS = 24.0
+DEFAULT_FRP_HOURS = 24.0
 FILE_DURATION_MINUTES = 10.0
 N_PERMUTATIONS = 10_000
 RANDOM_SEED = 20260911
@@ -49,8 +50,6 @@ PRIMARY_PHASE_BINS = 12
 PHASE_ORIGIN_OFFSETS_MINUTES = tuple(range(0, 120, 10))
 DECOMPOSITION_TOLERANCE_BITS = 1e-12
 
-INPUT_DIR = Path(r"C:\Users\Jeff\Documents\CBAS_Analysis_Data")
-OUTPUT_DIR = INPUT_DIR / "MI_Demo_Output"
 INPUT_FILENAME_PATTERN = re.compile(
     r"^(?P<animal>.+)_(?P<index>\d{5})_curated_aug_model_outputs\.csv$"
 )
@@ -76,21 +75,26 @@ LEGACY_OUTPUT_FILENAMES = (
 def discover_input_files(input_dir: Path) -> tuple[list[tuple[int, Path]], list[int]]:
     """Find and numerically sort the expected source CSV files."""
 
+    if not input_dir.is_dir():
+        raise FileNotFoundError(
+            f"Input directory does not exist or is not a directory: {input_dir}"
+        )
+
     csv_files = sorted(input_dir.glob("*.csv"))
-    if not csv_files:
-        raise FileNotFoundError(f"No CSV files found in {input_dir}")
 
     parsed: list[tuple[int, Path]] = []
     animals: set[str] = set()
     for path in csv_files:
         match = INPUT_FILENAME_PATTERN.fullmatch(path.name)
         if match is None:
-            raise ValueError(
-                "Could not determine a numeric sequence index from expected "
-                f"filename pattern: {path.name}"
-            )
+            continue
         animals.add(match.group("animal"))
         parsed.append((int(match.group("index")), path))
+
+    if not parsed:
+        raise FileNotFoundError(
+            f"No matching CBAS source CSV files found in {input_dir}"
+        )
 
     if len(animals) != 1:
         raise ValueError(
@@ -171,13 +175,15 @@ def read_and_classify(path: Path) -> tuple[int, np.ndarray, np.ndarray]:
 def phase_bin_indices(
     phase_hours: np.ndarray,
     n_bins: int,
+    *,
+    frp_hours: float,
     origin_hours: float = 0.0,
 ) -> np.ndarray:
     """Assign phase values to equal-width half-open bins at a chosen origin."""
 
-    hours_per_bin = FRP_HOURS / n_bins
-    rotated_phase = np.mod(phase_hours - origin_hours, FRP_HOURS)
-    safe_phase = np.minimum(rotated_phase, np.nextafter(FRP_HOURS, 0.0))
+    hours_per_bin = frp_hours / n_bins
+    rotated_phase = np.mod(phase_hours - origin_hours, frp_hours)
+    safe_phase = np.minimum(rotated_phase, np.nextafter(frp_hours, 0.0))
     return np.floor(safe_phase / hours_per_bin).astype(np.int64)
 
 
@@ -278,30 +284,32 @@ def shifted_cycle_counts(
     labels: np.ndarray,
     offsets_hours: np.ndarray,
     n_bins: int,
+    *,
+    frp_hours: float,
     origin_hours: float = 0.0,
 ) -> np.ndarray:
     """Count shifted cycle behaviors for each random circular time offset.
 
-    ``event_times`` are within-cycle times in [0, 24). For an offset d, a
-    source event at time t is assigned to phase (t + d) modulo 24. Prefix
+    ``event_times`` are within-cycle times in [0, frp_hours). For an offset d, a
+    source event at time t is assigned to phase (t + d) modulo frp_hours. Prefix
     counts and binary searches make this exact for irregular valid-row times
     without shuffling the behavioral labels.
     """
 
     prefix = build_prefix_counts(labels)
     n_events = len(labels)
-    bin_width = FRP_HOURS / n_bins
+    bin_width = frp_hours / n_bins
     bin_starts = np.mod(
         origin_hours + np.arange(n_bins, dtype=float) * bin_width,
-        FRP_HOURS,
+        frp_hours,
     )
 
-    starts = np.mod(bin_starts[None, :] - offsets_hours[:, None], FRP_HOURS)
+    starts = np.mod(bin_starts[None, :] - offsets_hours[:, None], frp_hours)
     ends = starts + bin_width
-    wraps = ends > FRP_HOURS
+    wraps = ends > frp_hours
 
     left = np.searchsorted(event_times, starts, side="left")
-    right = np.searchsorted(event_times, np.minimum(ends, FRP_HOURS), side="left")
+    right = np.searchsorted(event_times, np.minimum(ends, frp_hours), side="left")
     counts = np.empty(
         (len(offsets_hours), n_bins, len(BEHAVIORS)), dtype=np.int64
     )
@@ -312,7 +320,7 @@ def shifted_cycle_counts(
 
     if wraps.any():
         wrapped_right = np.searchsorted(
-            event_times, ends[wraps] - FRP_HOURS, side="left"
+            event_times, ends[wraps] - frp_hours, side="left"
         )
         counts[wraps] = (
             prefix[n_events]
@@ -327,6 +335,8 @@ def calculate_null_tables(
     complete_cycles: list[tuple[int, np.ndarray, np.ndarray]],
     offsets_hours: np.ndarray,
     n_bins: int,
+    *,
+    frp_hours: float,
     origin_hours: float = 0.0,
 ) -> np.ndarray:
     """Aggregate independently shifted complete cycles for all permutations."""
@@ -340,6 +350,7 @@ def calculate_null_tables(
             labels,
             offsets_hours[:, cycle_number],
             n_bins,
+            frp_hours=frp_hours,
             origin_hours=origin_hours,
         )
     return null_counts
@@ -348,15 +359,22 @@ def calculate_null_tables(
 def observed_counts_from_complete_cycles(
     complete_cycles: list[tuple[int, np.ndarray, np.ndarray]],
     n_bins: int,
+    *,
+    frp_hours: float,
     origin_hours: float = 0.0,
 ) -> np.ndarray:
     """Build observed phase-by-behavior counts from exactly the null cycles."""
 
     counts = np.zeros((n_bins, len(BEHAVIORS)), dtype=np.int64)
     for _, event_times, labels in complete_cycles:
-        phase_hours = np.mod(event_times, FRP_HOURS)
+        phase_hours = np.mod(event_times, frp_hours)
         counts += contingency_table(
-            phase_bin_indices(phase_hours, n_bins, origin_hours=origin_hours),
+            phase_bin_indices(
+                phase_hours,
+                n_bins,
+                frp_hours=frp_hours,
+                origin_hours=origin_hours,
+            ),
             labels,
             n_bins,
         )
@@ -370,6 +388,8 @@ def calculate_phase_origin_sensitivity(
     primary_null_counts: np.ndarray,
     primary_metrics: dict[str, float],
     complete_sample_count: int,
+    *,
+    frp_hours: float,
 ) -> pd.DataFrame:
     """Calculate corrected MI while rotating the 12-bin phase origin."""
 
@@ -383,12 +403,14 @@ def calculate_phase_origin_sensitivity(
             observed_counts = observed_counts_from_complete_cycles(
                 complete_cycles,
                 PRIMARY_PHASE_BINS,
+                frp_hours=frp_hours,
                 origin_hours=origin_hours,
             )
             null_counts = calculate_null_tables(
                 complete_cycles,
                 offsets_hours,
                 PRIMARY_PHASE_BINS,
+                frp_hours=frp_hours,
                 origin_hours=origin_hours,
             )
 
@@ -654,15 +676,20 @@ def calculate_primary_mi_decomposition(
     return decomposition_frame, null_frame, details
 
 
-def make_phase_labels(n_bins: int) -> list[str]:
-    hours_per_bin = FRP_HOURS / n_bins
+def make_phase_labels(n_bins: int, *, frp_hours: float) -> list[str]:
+    hours_per_bin = frp_hours / n_bins
     return [
         f"{int(start):02d}-{int(start + hours_per_bin):02d}"
         for start in np.arange(n_bins, dtype=float) * hours_per_bin
     ]
 
 
-def save_phase_behavior_profile(counts: np.ndarray, path: Path) -> None:
+def save_phase_behavior_profile(
+    counts: np.ndarray,
+    path: Path,
+    *,
+    frp_hours: float,
+) -> None:
     """Save the primary phase-by-behavior composition as proportions."""
 
     phase_totals = counts.sum(axis=1)
@@ -670,7 +697,7 @@ def save_phase_behavior_profile(counts: np.ndarray, path: Path) -> None:
         raise ValueError("Every primary phase bin must contain at least one sample.")
     proportions = counts.astype(float) / phase_totals[:, None]
     n_bins = counts.shape[0]
-    hours_per_bin = FRP_HOURS / n_bins
+    hours_per_bin = frp_hours / n_bins
     profile = pd.DataFrame(proportions, columns=BEHAVIORS)
     profile.insert(0, "phase_bin", np.arange(n_bins, dtype=int))
     profile.insert(
@@ -744,6 +771,8 @@ def save_overview_plot(
     primary_metrics: dict[str, float],
     primary_null_mi: np.ndarray,
     decomposition_details: dict[str, float],
+    *,
+    frp_hours: float,
 ) -> None:
     """Save the three-panel overview figure for the primary analysis."""
 
@@ -764,7 +793,11 @@ def save_overview_plot(
     axes[0].set_xlabel("Relative circadian phase (hours)")
     axes[0].set_ylabel("Behavior")
     axes[0].set_xticks(np.arange(PRIMARY_PHASE_BINS))
-    axes[0].set_xticklabels(make_phase_labels(PRIMARY_PHASE_BINS), rotation=45, ha="right")
+    axes[0].set_xticklabels(
+        make_phase_labels(PRIMARY_PHASE_BINS, frp_hours=frp_hours),
+        rotation=45,
+        ha="right",
+    )
     axes[0].set_yticks(np.arange(len(BEHAVIORS)))
     axes[0].set_yticklabels(BEHAVIORS)
     colorbar = figure.colorbar(image, ax=axes[0], fraction=0.046, pad=0.04)
@@ -837,6 +870,8 @@ def write_run_summary(
     path: Path,
     input_dir: Path,
     animal_prefix: str,
+    frp_hours: float,
+    frp_source: str,
     input_count: int,
     first_file_index: int,
     last_file_index: int,
@@ -876,7 +911,8 @@ def write_run_summary(
         f"complete_cycle_sample_count: {complete_sample_count}",
         f"partial_cycle_samples_excluded_from_corrected_MI: {all_available_sample_count - complete_sample_count}",
         f"rows_excluded_as_unclassifiable: {invalid_rows}",
-        f"FRP_hours: {FRP_HOURS:.1f}",
+        f"FRP_hours: {frp_hours}",
+        f"FRP_source: {frp_source}",
         f"phase_anchor: first valid row of source file 00000, row index {anchor_row_index}, defines relative phase 0",
         f"primary_phase_bin_count: {PRIMARY_PHASE_BINS}",
         f"permutation_count: {N_PERMUTATIONS}",
@@ -900,16 +936,45 @@ def write_run_summary(
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def parse_args() -> tuple[Path, float, str]:
+    parser = argparse.ArgumentParser(
+        description="Run the single-animal Phase x Behavior mutual-information analysis."
+    )
+    parser.add_argument(
+        "input_dir",
+        type=Path,
+        help="Folder containing one animal's sequential CBAS output CSV files.",
+    )
+    parser.add_argument(
+        "--frp-hours",
+        dest="frp_hours",
+        type=float,
+        default=None,
+        help="Free-running period in hours; defaults to 24.0.",
+    )
+    args = parser.parse_args()
+    if args.frp_hours is None:
+        frp_hours = DEFAULT_FRP_HOURS
+        frp_source = "default"
+    else:
+        frp_hours = args.frp_hours
+        frp_source = "user_supplied"
+        if not np.isfinite(frp_hours) or frp_hours <= 0:
+            parser.error("--frp-hours must be finite and greater than 0.")
+    return args.input_dir.expanduser().resolve(), frp_hours, frp_source
+
+
 def main() -> None:
-    output_dir = OUTPUT_DIR
+    input_dir, frp_hours, frp_source = parse_args()
+    input_files, missing_indices = discover_input_files(input_dir)
+    output_dir = input_dir / "MI_Output"
     output_dir.mkdir(parents=True, exist_ok=True)
     remove_known_legacy_outputs(output_dir)
 
-    input_files, missing_indices = discover_input_files(INPUT_DIR)
     animal_match = INPUT_FILENAME_PATTERN.fullmatch(input_files[0][1].name)
     assert animal_match is not None
     animal_prefix = animal_match.group("animal")
-    files_per_cycle = int(round(FRP_HOURS * 60.0 / FILE_DURATION_MINUTES))
+    files_per_cycle = int(round(frp_hours * 60.0 / FILE_DURATION_MINUTES))
 
     all_available_counts_by_bins = {
         n_bins: np.zeros((n_bins, len(BEHAVIORS)), dtype=np.int64)
@@ -943,11 +1008,15 @@ def main() -> None:
             anchor_row_index = int(row_indices[0])
         assert anchor_elapsed_hours is not None
         relative_elapsed_hours = raw_elapsed_hours - anchor_elapsed_hours
-        relative_phase_hours = np.mod(relative_elapsed_hours, FRP_HOURS)
-        cycle_index = np.floor(relative_elapsed_hours / FRP_HOURS).astype(np.int64)
+        relative_phase_hours = np.mod(relative_elapsed_hours, frp_hours)
+        cycle_index = np.floor(relative_elapsed_hours / frp_hours).astype(np.int64)
 
         for n_bins in PHASE_BIN_COUNTS:
-            bins = phase_bin_indices(relative_phase_hours, n_bins)
+            bins = phase_bin_indices(
+                relative_phase_hours,
+                n_bins,
+                frp_hours=frp_hours,
+            )
             all_available_counts_by_bins[n_bins] += contingency_table(bins, labels, n_bins)
 
         behavior_counts += np.bincount(labels, minlength=len(BEHAVIORS))
@@ -981,7 +1050,7 @@ def main() -> None:
         cycle_times = np.concatenate(
             [
                 np.asarray(record["relative_elapsed_hours"], dtype=float)
-                - cycle_index * FRP_HOURS
+                - cycle_index * frp_hours
                 for record in records
             ]
         )
@@ -992,14 +1061,18 @@ def main() -> None:
 
     if not complete_cycles:
         raise ValueError(
-            "No complete 24-hour cycles are available for the permutation null."
+            f"No complete {frp_hours:g}-hour cycles are available for the permutation null."
         )
 
     complete_sample_count = int(
         sum(len(cycle_labels) for _, _, cycle_labels in complete_cycles)
     )
     complete_counts_by_bins = {
-        n_bins: observed_counts_from_complete_cycles(complete_cycles, n_bins)
+        n_bins: observed_counts_from_complete_cycles(
+            complete_cycles,
+            n_bins,
+            frp_hours=frp_hours,
+        )
         for n_bins in PHASE_BIN_COUNTS
     }
     all_available_mi_by_bins = {
@@ -1010,7 +1083,7 @@ def main() -> None:
     rng = np.random.default_rng(RANDOM_SEED)
     offsets_hours = rng.uniform(
         0.0,
-        FRP_HOURS,
+        frp_hours,
         size=(N_PERMUTATIONS, len(complete_cycles)),
     )
 
@@ -1022,6 +1095,7 @@ def main() -> None:
             complete_cycles,
             offsets_hours,
             n_bins,
+            frp_hours=frp_hours,
         )
         null_tables_by_bins[n_bins] = null_counts
         metrics, null_mi, null_nmi = analyze_observed_and_null(
@@ -1033,7 +1107,7 @@ def main() -> None:
         summary_rows.append(
             {
                 "phase_bins": n_bins,
-                "hours_per_bin": FRP_HOURS / n_bins,
+                "hours_per_bin": frp_hours / n_bins,
                 **metrics,
                 "MI_raw_all_available_bits": all_available_mi_by_bins[n_bins],
                 "n_valid_samples": complete_sample_count,
@@ -1067,6 +1141,7 @@ def main() -> None:
         primary_null_counts,
         primary_metrics,
         complete_sample_count,
+        frp_hours=frp_hours,
     )
     origin_excess = phase_origin_sensitivity["MI_excess_bits"]
     origin_summary = {
@@ -1093,6 +1168,7 @@ def main() -> None:
     save_phase_behavior_profile(
         primary_counts,
         output_dir / "phase_behavior_profile.csv",
+        frp_hours=frp_hours,
     )
     build_sensitivity_frame(
         summary_frame,
@@ -1107,11 +1183,14 @@ def main() -> None:
         primary_metrics,
         primary_null_mi,
         decomposition_details,
+        frp_hours=frp_hours,
     )
     write_run_summary(
         output_dir / "run_summary.txt",
-        input_dir=INPUT_DIR,
+        input_dir=input_dir,
         animal_prefix=animal_prefix,
+        frp_hours=frp_hours,
+        frp_source=frp_source,
         input_count=len(input_files),
         first_file_index=input_files[0][0],
         last_file_index=input_files[-1][0],
@@ -1126,6 +1205,7 @@ def main() -> None:
     )
 
     print("Phase x Behavior mutual-information demonstration complete.")
+    print(f"FRP: {frp_hours} hours ({frp_source})")
     print(f"Input CSV files: {len(input_files)} ({input_files[0][0]} through {input_files[-1][0]})")
     print(f"Valid samples (all available): {total_valid_samples}")
     print(f"Complete-cycle samples used for MI: {complete_sample_count}")
