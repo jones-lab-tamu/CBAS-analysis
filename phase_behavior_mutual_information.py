@@ -866,6 +866,42 @@ def save_overview_plot(
     plt.close(figure)
 
 
+def save_animal_mi_summary(
+    path: Path,
+    animal_id: str,
+    frp_hours: float,
+    frp_source: str,
+    decomposition_details: dict[str, float],
+) -> None:
+    """Save the compact one-row downstream analysis summary."""
+
+    columns = [
+        "animal_id",
+        "FRP_hours",
+        "FRP_source",
+        "P_rest",
+        "P_nonrest",
+        "MI9_excess_bits",
+        "MI_rest_nonrest_excess_bits",
+        "MI_conditional8_excess_bits",
+        "MI_conditional8_weighted_excess_bits",
+    ]
+    row = {
+        "animal_id": animal_id,
+        "FRP_hours": frp_hours,
+        "FRP_source": frp_source,
+        "P_rest": decomposition_details["p_rest"],
+        "P_nonrest": decomposition_details["p_nonrest"],
+        "MI9_excess_bits": decomposition_details["mi9_excess"],
+        "MI_rest_nonrest_excess_bits": decomposition_details["rest_nonrest_excess"],
+        "MI_conditional8_excess_bits": decomposition_details["conditional_8state_excess"],
+        "MI_conditional8_weighted_excess_bits": decomposition_details[
+            "weighted_conditional_excess"
+        ],
+    }
+    pd.DataFrame([row], columns=columns).to_csv(path, index=False)
+
+
 def write_run_summary(
     path: Path,
     input_dir: Path,
@@ -1160,6 +1196,13 @@ def main() -> None:
     decomposition_frame.to_csv(
         output_dir / "mi_results.csv",
         index=False,
+    )
+    save_animal_mi_summary(
+        output_dir / "animal_mi_summary.csv",
+        animal_id=animal_prefix,
+        frp_hours=frp_hours,
+        frp_source=frp_source,
+        decomposition_details=decomposition_details,
     )
     null_frame.to_csv(
         output_dir / "mi_null_distribution.csv",

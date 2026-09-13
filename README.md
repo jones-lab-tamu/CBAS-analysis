@@ -9,6 +9,8 @@ Analysis code for circadian behavioral organization using CBAS behavioral classi
 - Phase-bin width sensitivity
 - Phase-bin origin sensitivity
 
+For definitions and interpretation of MI output variables, see `MI_VARIABLES.md`.
+
 ## Data
 
 Raw CBAS data are stored separately from this repository and are not version controlled.
