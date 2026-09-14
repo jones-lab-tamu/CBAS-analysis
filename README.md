@@ -10,6 +10,7 @@ Analysis code for circadian behavioral organization using CBAS behavioral classi
 - Phase-bin origin sensitivity
 
 For definitions and interpretation of MI output variables, see `MI_VARIABLES.md`.
+For definitions and interpretation of recurrence output variables, see `RECURRENCE_VARIABLES.md`.
 
 ## Data
 
