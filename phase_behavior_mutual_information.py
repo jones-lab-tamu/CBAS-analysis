@@ -1235,6 +1235,9 @@ def main() -> None:
     ) * FILE_DURATION_MINUTES / 60.0
 
     complete_cycles: list[tuple[int, np.ndarray, np.ndarray]] = []
+    cycle_time_tolerance = (
+        8.0 * np.finfo(float).eps * max(1.0, computational_frp_hours)
+    )
     for cycle_index, start_boundary, end_boundary in complete_cycle_specs:
         records = list(file_records.values())
         selected_records: list[tuple[np.ndarray, np.ndarray]] = []
@@ -1258,10 +1261,17 @@ def main() -> None:
             [times for times, _ in selected_records]
         )
         cycle_labels = np.concatenate([labels for _, labels in selected_records])
-        if np.any(cycle_times < 0.0) or np.any(cycle_times >= computational_frp_hours):
+        if np.any(cycle_times < -cycle_time_tolerance) or np.any(
+            cycle_times > computational_frp_hours + cycle_time_tolerance
+        ):
             raise ValueError(
                 f"Samples assigned to full cycle {cycle_index} fall outside its FRP interval"
             )
+        cycle_times = np.clip(
+            cycle_times,
+            0.0,
+            np.nextafter(computational_frp_hours, 0.0),
+        )
         complete_cycles.append((cycle_index, cycle_times, cycle_labels))
 
     if not complete_cycles:
