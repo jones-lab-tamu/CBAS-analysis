@@ -2,12 +2,12 @@
 
 This script reads one animal's CBAS model-output CSV files from a command-line
 input directory, assigns a winner-take-all behavior to each classifiable row,
-reconstructs elapsed time, and writes the requested MI tables, null
-distribution, plot, and text summary to ``<input_dir>\\MI_Output``.
+consumes the animal's frozen FRP/CT solution, and writes the requested MI
+tables, null distribution, plot, and text summary to ``<input_dir>\\MI_Output``.
 
-The analysis is intentionally single-animal and focused. It uses a runtime
-free-running period and a relative phase anchor; it does not assign biological
-CT or perform any genotype or recurrence analysis.
+The analysis is intentionally single-animal and focused. It does not estimate
+FRP or infer the biological phase anchor; those inputs come from the existing
+``FRP_Phase_Output`` directory.
 """
 
 from __future__ import annotations
@@ -41,8 +41,8 @@ NONRESTING_BEHAVIOR_INDICES = tuple(
     index for index, behavior in enumerate(BEHAVIORS) if behavior != "resting"
 )
 
-DEFAULT_FRP_HOURS = 24.0
 FILE_DURATION_MINUTES = 10.0
+CT_HOURS = 24.0
 N_PERMUTATIONS = 10_000
 RANDOM_SEED = 20260911
 PHASE_BIN_COUNTS = (8, 12, 24)
@@ -110,14 +110,127 @@ def discover_input_files(input_dir: Path) -> tuple[list[tuple[int, Path]], list[
     if duplicate_indices:
         raise ValueError(f"Duplicate numeric sequence indices found: {duplicate_indices}")
 
-    if indices[0] != 0:
-        raise ValueError(
-            "File sequence must include 00000 because it defines the phase anchor."
-        )
-
     expected = set(range(indices[0], indices[-1] + 1))
     missing_indices = sorted(expected.difference(indices))
     return parsed, missing_indices
+
+
+def _parse_cycle_flag(value: object) -> bool:
+    """Parse the boolean representation written by the FRP phase script."""
+
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes"}:
+        return True
+    if text in {"false", "0", "no"}:
+        return False
+    raise ValueError(f"Could not parse full_cycle_flag value: {value!r}")
+
+
+def load_frp_phase_solution(
+    input_dir: Path,
+) -> tuple[float, float, float, list[tuple[int, float, float]], Path]:
+    """Read the selected FRP, anchor, and full-cycle boundaries from disk."""
+
+    phase_dir = input_dir / "FRP_Phase_Output"
+    summary_path = phase_dir / "frp_phase_summary.csv"
+    cycles_path = phase_dir / "frp_phase_cycles.csv"
+    if not summary_path.is_file() or not cycles_path.is_file():
+        raise FileNotFoundError(
+            "Expected FRP/phase outputs before MI analysis: "
+            f"{summary_path} and {cycles_path}"
+        )
+
+    summary = pd.read_csv(summary_path)
+    if len(summary) != 1:
+        raise ValueError("frp_phase_summary.csv must contain exactly one row")
+    required_summary_columns = {"selected_frp_hours", "start_ct_used"}
+    missing_summary_columns = required_summary_columns.difference(summary.columns)
+    if missing_summary_columns:
+        raise ValueError(
+            "FRP phase summary is missing columns: "
+            f"{sorted(missing_summary_columns)}"
+        )
+    reported_frp_hours = float(summary.loc[0, "selected_frp_hours"])
+    start_ct = float(summary.loc[0, "start_ct_used"])
+    if not np.isfinite(reported_frp_hours) or reported_frp_hours <= 0.0:
+        raise ValueError(
+            "Invalid selected_frp_hours in FRP phase summary: "
+            f"{reported_frp_hours}"
+        )
+    if not np.isfinite(start_ct) or not 0.0 <= start_ct < CT_HOURS:
+        raise ValueError(f"Invalid start_ct_used in FRP phase summary: {start_ct}")
+
+    cycles = pd.read_csv(cycles_path)
+    required_cycle_columns = {
+        "cycle_index",
+        "elapsed_start_boundary_hours",
+        "elapsed_end_boundary_hours",
+        "missing_bin_count",
+        "full_cycle_flag",
+    }
+    missing_cycle_columns = required_cycle_columns.difference(cycles.columns)
+    if missing_cycle_columns:
+        raise ValueError(
+            "FRP phase cycle summary is missing columns: "
+            f"{sorted(missing_cycle_columns)}"
+        )
+
+    complete_cycles: list[tuple[int, float, float]] = []
+    for _, row in cycles.iterrows():
+        if not _parse_cycle_flag(row["full_cycle_flag"]):
+            continue
+        cycle_index = int(row["cycle_index"])
+        start_boundary = float(row["elapsed_start_boundary_hours"])
+        end_boundary = float(row["elapsed_end_boundary_hours"])
+        missing_bins = int(row["missing_bin_count"])
+        if not np.isfinite(start_boundary) or not np.isfinite(end_boundary):
+            raise ValueError(
+                f"Full cycle {cycle_index} has a non-finite elapsed boundary"
+            )
+        if end_boundary <= start_boundary:
+            raise ValueError(f"Full cycle {cycle_index} has invalid boundaries")
+        if missing_bins != 0:
+            raise ValueError(
+                f"FRP output marks cycle {cycle_index} full despite "
+                f"{missing_bins} missing bins"
+            )
+        complete_cycles.append((cycle_index, start_boundary, end_boundary))
+
+    complete_cycles.sort(key=lambda item: item[0])
+    if not complete_cycles:
+        raise ValueError("FRP phase output contains no full biological cycles")
+
+    full_cycle_durations = np.asarray(
+        [end - start for _, start, end in complete_cycles],
+        dtype=float,
+    )
+    computational_frp_hours = float(full_cycle_durations[0])
+    if not np.allclose(
+        full_cycle_durations,
+        computational_frp_hours,
+        rtol=1e-9,
+        atol=1e-9,
+    ):
+        raise ValueError(
+            "Full FRP cycle durations disagree beyond floating-point tolerance: "
+            f"{full_cycle_durations.tolist()}"
+        )
+
+    if "number_of_full_ct0_ct24_cycles" in summary.columns:
+        reported_count = int(summary.loc[0, "number_of_full_ct0_ct24_cycles"])
+        if reported_count != len(complete_cycles):
+            raise ValueError(
+                "FRP summary and cycle table disagree about the number of full cycles"
+            )
+    return (
+        reported_frp_hours,
+        computational_frp_hours,
+        start_ct,
+        complete_cycles,
+        phase_dir,
+    )
 
 
 def remove_known_legacy_outputs(output_dir: Path) -> None:
@@ -185,6 +298,24 @@ def phase_bin_indices(
     rotated_phase = np.mod(phase_hours - origin_hours, frp_hours)
     safe_phase = np.minimum(rotated_phase, np.nextafter(frp_hours, 0.0))
     return np.floor(safe_phase / hours_per_bin).astype(np.int64)
+
+
+def ct_phase_bin_indices(
+    cycle_times: np.ndarray,
+    n_bins: int,
+    *,
+    frp_hours: float,
+    origin_ct_hours: float = 0.0,
+) -> np.ndarray:
+    """Assign within-cycle real times to equal-width normalized CT bins."""
+
+    phase_ct_hours = np.mod(CT_HOURS * cycle_times / frp_hours, CT_HOURS)
+    return phase_bin_indices(
+        phase_ct_hours,
+        n_bins,
+        frp_hours=CT_HOURS,
+        origin_hours=origin_ct_hours,
+    )
 
 
 def contingency_table(bin_indices: np.ndarray, labels: np.ndarray, n_bins: int) -> np.ndarray:
@@ -291,25 +422,31 @@ def shifted_cycle_counts(
     """Count shifted cycle behaviors for each random circular time offset.
 
     ``event_times`` are within-cycle times in [0, frp_hours). For an offset d, a
-    source event at time t is assigned to phase (t + d) modulo frp_hours. Prefix
-    counts and binary searches make this exact for irregular valid-row times
-    without shuffling the behavioral labels.
+    source event at time t is assigned to time (t + d) modulo frp_hours. The
+    resulting time is then mapped to normalized CT0-CT24 bins. Prefix counts
+    and binary searches make this exact for irregular valid-row times without
+    shuffling the behavioral labels. ``origin_hours`` is a CT-hour bin origin.
     """
 
     prefix = build_prefix_counts(labels)
     n_events = len(labels)
-    bin_width = frp_hours / n_bins
-    bin_starts = np.mod(
-        origin_hours + np.arange(n_bins, dtype=float) * bin_width,
-        frp_hours,
+    ct_bin_width = CT_HOURS / n_bins
+    ct_bin_starts = np.mod(
+        origin_hours + np.arange(n_bins, dtype=float) * ct_bin_width,
+        CT_HOURS,
     )
+    offset_ct_hours = CT_HOURS * offsets_hours / frp_hours
+    starts_ct = np.mod(
+        ct_bin_starts[None, :] - offset_ct_hours[:, None],
+        CT_HOURS,
+    )
+    ends_ct = starts_ct + ct_bin_width
+    wraps = ends_ct > CT_HOURS
 
-    starts = np.mod(bin_starts[None, :] - offsets_hours[:, None], frp_hours)
-    ends = starts + bin_width
-    wraps = ends > frp_hours
-
+    starts = starts_ct * frp_hours / CT_HOURS
+    ends = np.minimum(ends_ct, CT_HOURS) * frp_hours / CT_HOURS
     left = np.searchsorted(event_times, starts, side="left")
-    right = np.searchsorted(event_times, np.minimum(ends, frp_hours), side="left")
+    right = np.searchsorted(event_times, ends, side="left")
     counts = np.empty(
         (len(offsets_hours), n_bins, len(BEHAVIORS)), dtype=np.int64
     )
@@ -320,7 +457,9 @@ def shifted_cycle_counts(
 
     if wraps.any():
         wrapped_right = np.searchsorted(
-            event_times, ends[wraps] - frp_hours, side="left"
+            event_times,
+            (ends_ct[wraps] - CT_HOURS) * frp_hours / CT_HOURS,
+            side="left",
         )
         counts[wraps] = (
             prefix[n_events]
@@ -367,13 +506,12 @@ def observed_counts_from_complete_cycles(
 
     counts = np.zeros((n_bins, len(BEHAVIORS)), dtype=np.int64)
     for _, event_times, labels in complete_cycles:
-        phase_hours = np.mod(event_times, frp_hours)
         counts += contingency_table(
-            phase_bin_indices(
-                phase_hours,
+            ct_phase_bin_indices(
+                event_times,
                 n_bins,
                 frp_hours=frp_hours,
-                origin_hours=origin_hours,
+                origin_ct_hours=origin_hours,
             ),
             labels,
             n_bins,
@@ -677,7 +815,8 @@ def calculate_primary_mi_decomposition(
 
 
 def make_phase_labels(n_bins: int, *, frp_hours: float) -> list[str]:
-    hours_per_bin = frp_hours / n_bins
+    del frp_hours
+    hours_per_bin = CT_HOURS / n_bins
     return [
         f"{int(start):02d}-{int(start + hours_per_bin):02d}"
         for start in np.arange(n_bins, dtype=float) * hours_per_bin
@@ -697,7 +836,8 @@ def save_phase_behavior_profile(
         raise ValueError("Every primary phase bin must contain at least one sample.")
     proportions = counts.astype(float) / phase_totals[:, None]
     n_bins = counts.shape[0]
-    hours_per_bin = frp_hours / n_bins
+    del frp_hours
+    hours_per_bin = CT_HOURS / n_bins
     profile = pd.DataFrame(proportions, columns=BEHAVIORS)
     profile.insert(0, "phase_bin", np.arange(n_bins, dtype=int))
     profile.insert(
@@ -790,7 +930,7 @@ def save_overview_plot(
         origin="lower",
     )
     axes[0].set_title("A. Phase x behavior profile")
-    axes[0].set_xlabel("Relative circadian phase (hours)")
+    axes[0].set_xlabel("Circadian time (CT hours)")
     axes[0].set_ylabel("Behavior")
     axes[0].set_xticks(np.arange(PRIMARY_PHASE_BINS))
     axes[0].set_xticklabels(
@@ -869,8 +1009,12 @@ def save_overview_plot(
 def save_animal_mi_summary(
     path: Path,
     animal_id: str,
-    frp_hours: float,
+    reported_frp_hours: float,
+    computational_frp_hours: float,
     frp_source: str,
+    start_ct: float,
+    complete_cycle_indices: list[int],
+    full_metrics: dict[str, float],
     decomposition_details: dict[str, float],
 ) -> None:
     """Save the compact one-row downstream analysis summary."""
@@ -878,7 +1022,18 @@ def save_animal_mi_summary(
     columns = [
         "animal_id",
         "FRP_hours",
+        "computational_FRP_hours",
         "FRP_source",
+        "start_CT",
+        "complete_cycle_indices",
+        "n_complete_cycles_used",
+        "MI9_raw_bits",
+        "MI9_null_mean_bits",
+        "MI9_null_SD_bits",
+        "MI9_z",
+        "NMI9_raw",
+        "NMI9_null_mean",
+        "NMI9_excess",
         "P_rest",
         "P_nonrest",
         "MI9_excess_bits",
@@ -888,8 +1043,19 @@ def save_animal_mi_summary(
     ]
     row = {
         "animal_id": animal_id,
-        "FRP_hours": frp_hours,
+        "FRP_hours": reported_frp_hours,
+        "computational_FRP_hours": computational_frp_hours,
         "FRP_source": frp_source,
+        "start_CT": start_ct,
+        "complete_cycle_indices": ",".join(map(str, complete_cycle_indices)),
+        "n_complete_cycles_used": len(complete_cycle_indices),
+        "MI9_raw_bits": full_metrics["MI_raw_bits"],
+        "MI9_null_mean_bits": full_metrics["MI_null_mean"],
+        "MI9_null_SD_bits": full_metrics["MI_null_SD"],
+        "MI9_z": full_metrics["MI_z"],
+        "NMI9_raw": full_metrics["NMI_raw"],
+        "NMI9_null_mean": full_metrics["NMI_null_mean"],
+        "NMI9_excess": full_metrics["NMI_excess"],
         "P_rest": decomposition_details["p_rest"],
         "P_nonrest": decomposition_details["p_nonrest"],
         "MI9_excess_bits": decomposition_details["mi9_excess"],
@@ -906,7 +1072,8 @@ def write_run_summary(
     path: Path,
     input_dir: Path,
     animal_prefix: str,
-    frp_hours: float,
+    reported_frp_hours: float,
+    computational_frp_hours: float,
     frp_source: str,
     input_count: int,
     first_file_index: int,
@@ -914,8 +1081,10 @@ def write_run_summary(
     missing_indices: list[int],
     total_duration_hours: float,
     invalid_rows: int,
-    anchor_row_index: int,
+    start_ct: float,
+    frp_phase_output_dir: Path,
     complete_cycle_indices: list[int],
+    complete_cycle_boundaries: list[tuple[int, float, float]],
     complete_sample_count: int,
     all_available_sample_count: int,
     decomposition_details: dict[str, float],
@@ -944,12 +1113,16 @@ def write_run_summary(
         f"total_valid_samples: {all_available_sample_count}",
         f"total_duration_hours: {total_duration_hours:.6f}",
         f"complete_cycles_used: [{cycle_text}]",
+        f"complete_cycle_boundaries_elapsed_hours: {complete_cycle_boundaries}",
         f"complete_cycle_sample_count: {complete_sample_count}",
         f"partial_cycle_samples_excluded_from_corrected_MI: {all_available_sample_count - complete_sample_count}",
         f"rows_excluded_as_unclassifiable: {invalid_rows}",
-        f"FRP_hours: {frp_hours}",
+        f"reported_FRP_hours_from_summary: {reported_frp_hours}",
+        f"computational_FRP_hours_from_full_cycle_boundaries: {computational_frp_hours}",
         f"FRP_source: {frp_source}",
-        f"phase_anchor: first valid row of source file 00000, row index {anchor_row_index}, defines relative phase 0",
+        f"FRP_phase_output_directory: {frp_phase_output_dir.resolve()}",
+        f"start_CT: {start_ct}",
+        f"phase_anchor: start of first supplied source file defines elapsed time 0; CT at elapsed time 0 is {start_ct}",
         f"primary_phase_bin_count: {PRIMARY_PHASE_BINS}",
         f"permutation_count: {N_PERMUTATIONS}",
         f"random_seed: {RANDOM_SEED}",
@@ -966,13 +1139,16 @@ def write_run_summary(
         f"{'PASS' if p_sum_pass else 'FAIL'}: P_rest + P_nonrest = {p_sum:.12g}.",
         f"PASS: width sensitivity completed for phase-bin counts {list(PHASE_BIN_COUNTS)}.",
         f"PASS: phase-origin sensitivity completed for offsets {list(PHASE_ORIGIN_OFFSETS_MINUTES)} minutes.",
+        "PASS: phase bins use normalized CT0-CT24 coordinates with the animal-specific FRP.",
+        "PASS: circular-shift null uses only FRP-marked full biological cycles.",
+        "PASS: conditional 8-state analysis retains the original normalized CT coordinates.",
         "PASS: raw source CSV files were read only and remain unchanged.",
         "",
     ]
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def parse_args() -> tuple[Path, float, str]:
+def parse_args() -> Path:
     parser = argparse.ArgumentParser(
         description="Run the single-animal Phase x Behavior mutual-information analysis."
     )
@@ -981,27 +1157,12 @@ def parse_args() -> tuple[Path, float, str]:
         type=Path,
         help="Folder containing one animal's sequential CBAS output CSV files.",
     )
-    parser.add_argument(
-        "--frp-hours",
-        dest="frp_hours",
-        type=float,
-        default=None,
-        help="Free-running period in hours; defaults to 24.0.",
-    )
     args = parser.parse_args()
-    if args.frp_hours is None:
-        frp_hours = DEFAULT_FRP_HOURS
-        frp_source = "default"
-    else:
-        frp_hours = args.frp_hours
-        frp_source = "user_supplied"
-        if not np.isfinite(frp_hours) or frp_hours <= 0:
-            parser.error("--frp-hours must be finite and greater than 0.")
-    return args.input_dir.expanduser().resolve(), frp_hours, frp_source
+    return args.input_dir.expanduser().resolve()
 
 
 def main() -> None:
-    input_dir, frp_hours, frp_source = parse_args()
+    input_dir = parse_args()
     input_files, missing_indices = discover_input_files(input_dir)
     output_dir = input_dir / "MI_Output"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1010,7 +1171,15 @@ def main() -> None:
     animal_match = INPUT_FILENAME_PATTERN.fullmatch(input_files[0][1].name)
     assert animal_match is not None
     animal_prefix = animal_match.group("animal")
-    files_per_cycle = int(round(frp_hours * 60.0 / FILE_DURATION_MINUTES))
+    (
+        reported_frp_hours,
+        computational_frp_hours,
+        start_ct,
+        complete_cycle_specs,
+        frp_phase_output_dir,
+    ) = load_frp_phase_solution(input_dir)
+    frp_source = "FRP_Phase_Output (Lomb-Scargle selected)"
+    first_file_index = input_files[0][0]
 
     all_available_counts_by_bins = {
         n_bins: np.zeros((n_bins, len(BEHAVIORS)), dtype=np.int64)
@@ -1018,40 +1187,32 @@ def main() -> None:
     }
     behavior_counts = np.zeros(len(BEHAVIORS), dtype=np.int64)
     file_records: dict[int, dict[str, object]] = {}
-    anchor_elapsed_hours: float | None = None
-    anchor_row_index: int | None = None
     total_valid_samples = 0
     invalid_rows = 0
 
     for file_index, path in input_files:
         n_rows, row_indices, labels = read_and_classify(path)
         invalid_rows += n_rows - len(labels)
-        if file_index == 0 and len(labels) == 0:
-            raise ValueError(
-                "File 00000 contains no classifiable rows, so the relative phase anchor cannot be defined."
-            )
 
-        file_start_hours = file_index * FILE_DURATION_MINUTES / 60.0
+        file_start_hours = (
+            file_index - first_file_index
+        ) * FILE_DURATION_MINUTES / 60.0
         if n_rows:
-            raw_elapsed_hours = file_start_hours + (
+            elapsed_hours = file_start_hours + (
                 row_indices.astype(float) / n_rows * FILE_DURATION_MINUTES / 60.0
             )
         else:
-            raw_elapsed_hours = np.empty(0, dtype=float)
-
-        if file_index == 0:
-            anchor_elapsed_hours = float(raw_elapsed_hours[0])
-            anchor_row_index = int(row_indices[0])
-        assert anchor_elapsed_hours is not None
-        relative_elapsed_hours = raw_elapsed_hours - anchor_elapsed_hours
-        relative_phase_hours = np.mod(relative_elapsed_hours, frp_hours)
-        cycle_index = np.floor(relative_elapsed_hours / frp_hours).astype(np.int64)
+            elapsed_hours = np.empty(0, dtype=float)
+        phase_ct_hours = np.mod(
+            start_ct + CT_HOURS * elapsed_hours / computational_frp_hours,
+            CT_HOURS,
+        )
 
         for n_bins in PHASE_BIN_COUNTS:
             bins = phase_bin_indices(
-                relative_phase_hours,
+                phase_ct_hours,
                 n_bins,
-                frp_hours=frp_hours,
+                frp_hours=CT_HOURS,
             )
             all_available_counts_by_bins[n_bins] += contingency_table(bins, labels, n_bins)
 
@@ -1062,42 +1223,50 @@ def main() -> None:
             "n_rows": n_rows,
             "row_indices": row_indices,
             "labels": labels,
-            "relative_elapsed_hours": relative_elapsed_hours,
+            "elapsed_hours": elapsed_hours,
         }
 
     if total_valid_samples == 0:
         raise ValueError("No valid behavioral samples were found in the input CSV files.")
 
     max_file_index = input_files[-1][0]
-    total_duration_hours = (max_file_index + 1) * FILE_DURATION_MINUTES / 60.0
+    total_duration_hours = (
+        max_file_index - first_file_index + 1
+    ) * FILE_DURATION_MINUTES / 60.0
 
     complete_cycles: list[tuple[int, np.ndarray, np.ndarray]] = []
-    max_cycle_index = max_file_index // files_per_cycle
-    for cycle_index in range(max_cycle_index + 1):
-        cycle_file_indices = range(
-            cycle_index * files_per_cycle,
-            (cycle_index + 1) * files_per_cycle,
-        )
-        if any(index not in file_records for index in cycle_file_indices):
-            continue
-        records = [file_records[index] for index in cycle_file_indices]
-        if any(int(record["labels"].size) == 0 for record in records):
-            continue
+    for cycle_index, start_boundary, end_boundary in complete_cycle_specs:
+        records = list(file_records.values())
+        selected_records: list[tuple[np.ndarray, np.ndarray]] = []
+        for record in records:
+            elapsed_hours = np.asarray(record["elapsed_hours"], dtype=float)
+            selected = (elapsed_hours >= start_boundary) & (
+                elapsed_hours < end_boundary
+            )
+            if selected.any():
+                selected_records.append(
+                    (
+                        elapsed_hours[selected] - start_boundary,
+                        np.asarray(record["labels"], dtype=np.int8)[selected],
+                    )
+                )
+        if not selected_records:
+            raise ValueError(
+                f"Full FRP cycle {cycle_index} contains no classifiable samples"
+            )
         cycle_times = np.concatenate(
-            [
-                np.asarray(record["relative_elapsed_hours"], dtype=float)
-                - cycle_index * frp_hours
-                for record in records
-            ]
+            [times for times, _ in selected_records]
         )
-        cycle_labels = np.concatenate(
-            [np.asarray(record["labels"], dtype=np.int8) for record in records]
-        )
+        cycle_labels = np.concatenate([labels for _, labels in selected_records])
+        if np.any(cycle_times < 0.0) or np.any(cycle_times >= computational_frp_hours):
+            raise ValueError(
+                f"Samples assigned to full cycle {cycle_index} fall outside its FRP interval"
+            )
         complete_cycles.append((cycle_index, cycle_times, cycle_labels))
 
     if not complete_cycles:
         raise ValueError(
-            f"No complete {frp_hours:g}-hour cycles are available for the permutation null."
+            "No complete biological cycles are available for the permutation null."
         )
 
     complete_sample_count = int(
@@ -1107,7 +1276,7 @@ def main() -> None:
         n_bins: observed_counts_from_complete_cycles(
             complete_cycles,
             n_bins,
-            frp_hours=frp_hours,
+            frp_hours=computational_frp_hours,
         )
         for n_bins in PHASE_BIN_COUNTS
     }
@@ -1119,7 +1288,7 @@ def main() -> None:
     rng = np.random.default_rng(RANDOM_SEED)
     offsets_hours = rng.uniform(
         0.0,
-        frp_hours,
+        computational_frp_hours,
         size=(N_PERMUTATIONS, len(complete_cycles)),
     )
 
@@ -1131,7 +1300,7 @@ def main() -> None:
             complete_cycles,
             offsets_hours,
             n_bins,
-            frp_hours=frp_hours,
+            frp_hours=computational_frp_hours,
         )
         null_tables_by_bins[n_bins] = null_counts
         metrics, null_mi, null_nmi = analyze_observed_and_null(
@@ -1143,7 +1312,7 @@ def main() -> None:
         summary_rows.append(
             {
                 "phase_bins": n_bins,
-                "hours_per_bin": frp_hours / n_bins,
+                "hours_per_bin": CT_HOURS / n_bins,
                 **metrics,
                 "MI_raw_all_available_bits": all_available_mi_by_bins[n_bins],
                 "n_valid_samples": complete_sample_count,
@@ -1177,7 +1346,7 @@ def main() -> None:
         primary_null_counts,
         primary_metrics,
         complete_sample_count,
-        frp_hours=frp_hours,
+        frp_hours=computational_frp_hours,
     )
     origin_excess = phase_origin_sensitivity["MI_excess_bits"]
     origin_summary = {
@@ -1200,8 +1369,12 @@ def main() -> None:
     save_animal_mi_summary(
         output_dir / "animal_mi_summary.csv",
         animal_id=animal_prefix,
-        frp_hours=frp_hours,
+        reported_frp_hours=reported_frp_hours,
+        computational_frp_hours=computational_frp_hours,
         frp_source=frp_source,
+        start_ct=start_ct,
+        complete_cycle_indices=[cycle_index for cycle_index, _, _ in complete_cycles],
+        full_metrics=primary_metrics,
         decomposition_details=decomposition_details,
     )
     null_frame.to_csv(
@@ -1211,7 +1384,7 @@ def main() -> None:
     save_phase_behavior_profile(
         primary_counts,
         output_dir / "phase_behavior_profile.csv",
-        frp_hours=frp_hours,
+        frp_hours=computational_frp_hours,
     )
     build_sensitivity_frame(
         summary_frame,
@@ -1226,13 +1399,14 @@ def main() -> None:
         primary_metrics,
         primary_null_mi,
         decomposition_details,
-        frp_hours=frp_hours,
+        frp_hours=computational_frp_hours,
     )
     write_run_summary(
         output_dir / "run_summary.txt",
         input_dir=input_dir,
         animal_prefix=animal_prefix,
-        frp_hours=frp_hours,
+        reported_frp_hours=reported_frp_hours,
+        computational_frp_hours=computational_frp_hours,
         frp_source=frp_source,
         input_count=len(input_files),
         first_file_index=input_files[0][0],
@@ -1240,15 +1414,19 @@ def main() -> None:
         missing_indices=missing_indices,
         total_duration_hours=total_duration_hours,
         invalid_rows=invalid_rows,
-        anchor_row_index=anchor_row_index if anchor_row_index is not None else -1,
+        start_ct=start_ct,
+        frp_phase_output_dir=frp_phase_output_dir,
         complete_cycle_indices=[cycle_index for cycle_index, _, _ in complete_cycles],
+        complete_cycle_boundaries=complete_cycle_specs,
         complete_sample_count=complete_sample_count,
         all_available_sample_count=total_valid_samples,
         decomposition_details=decomposition_details,
     )
 
     print("Phase x Behavior mutual-information demonstration complete.")
-    print(f"FRP: {frp_hours} hours ({frp_source})")
+    print(f"FRP (reported): {reported_frp_hours} hours ({frp_source})")
+    print(f"FRP (computational): {computational_frp_hours} hours")
+    print(f"Start CT: {start_ct}")
     print(f"Input CSV files: {len(input_files)} ({input_files[0][0]} through {input_files[-1][0]})")
     print(f"Valid samples (all available): {total_valid_samples}")
     print(f"Complete-cycle samples used for MI: {complete_sample_count}")
