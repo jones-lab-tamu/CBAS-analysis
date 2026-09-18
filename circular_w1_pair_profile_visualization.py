@@ -40,6 +40,16 @@ BEHAVIOR_ORDER = (
     "grooming",
     "locomotion",
 )
+MOCKUP_BEHAVIOR_LABELS = (
+    "Eating",
+    "Drinking",
+    "Rearing",
+    "Climbing",
+    "Digging",
+    "Nesting",
+    "Grooming",
+    "Exploring",
+)
 
 PAIR_SPECS = (
     {
@@ -856,6 +866,170 @@ def save_standalone_pair_figure(
     plt.close(figure)
 
 
+def plot_mockup_w1_axis(
+    ax: plt.Axes,
+    pair: dict[str, str],
+    pair_behavior: pd.DataFrame,
+    bar_limit: float,
+    y_max: float,
+    row_centers: np.ndarray,
+    lane_height: float,
+    *,
+    show_xlabel: bool,
+) -> None:
+    values = (
+        pair_behavior[pair_behavior["pair_id"] == pair["pair_id"]]
+        .set_index("behavior")
+        .loc[list(BEHAVIOR_ORDER), "behavior_w1_hours"]
+        .to_numpy(dtype=float)
+    )
+    composite_value = float(
+        pair_behavior[pair_behavior["pair_id"] == pair["pair_id"]][
+            "composite_repertoire_w1_hours"
+        ].iloc[0]
+    )
+    ax.barh(
+        row_centers,
+        values,
+        height=lane_height * 0.58,
+        color="#4D4D4D",
+        alpha=0.86,
+        zorder=2,
+    )
+    ax.axvline(
+        composite_value,
+        color="#D62728",
+        linestyle=(0, (3, 2)),
+        linewidth=0.85,
+        zorder=3,
+    )
+    ax.set_ylim(0.0, y_max)
+    ax.set_xlim(0.0, bar_limit)
+    ax.set_yticks(row_centers, [""] * len(BEHAVIOR_ORDER))
+    ax.set_xlabel("Per-behavior W1 (h)" if show_xlabel else "", fontsize=9.0)
+    ax.set_title("Composite W1", fontsize=9.0, pad=1.5)
+    ax.grid(axis="x", color="#BBBBBB", linewidth=0.45, alpha=0.55)
+    ax.set_axisbelow(True)
+    ax.tick_params(axis="x", labelsize=8, length=2)
+    ax.tick_params(axis="y", labelleft=False, length=0)
+    for spine in ax.spines.values():
+        spine.set_linewidth(0.55)
+
+
+def save_mockup_panel_figure(
+    display: pd.DataFrame,
+    pair_behavior: pd.DataFrame,
+    relative_density_max: float,
+    bar_limit: float,
+    output_path: Path,
+) -> None:
+    """Save a compact three-row Panel C candidate matching the supplied mockup."""
+
+    figure = plt.figure(figsize=(7.2, 13.8))
+    grid = plt.GridSpec(
+        len(STANDALONE_PAIR_SPECS),
+        3,
+        figure=figure,
+        width_ratios=(1.0, 1.0, 0.62),
+        hspace=0.15,
+        wspace=0.08,
+    )
+    lane_height, y_max, _, row_centers = lane_layout(relative_density_max)
+    row_axes: list[tuple[plt.Axes, plt.Axes, plt.Axes]] = []
+    row_titles = ("Low distance", "Intermediate distance", "High distance")
+
+    for row_index, pair in enumerate(STANDALONE_PAIR_SPECS):
+        axis_i = figure.add_subplot(grid[row_index, 0])
+        axis_j = figure.add_subplot(grid[row_index, 1])
+        axis_bar = figure.add_subplot(grid[row_index, 2])
+        plot_profile_axis(
+            axis_i,
+            display,
+            pair["animal_i"],
+            relative_density_max,
+            style="connected",
+            wrap_margin=False,
+        )
+        plot_profile_axis(
+            axis_j,
+            display,
+            pair["animal_j"],
+            relative_density_max,
+            style="connected",
+            wrap_margin=False,
+        )
+        plot_mockup_w1_axis(
+            axis_bar,
+            pair,
+            pair_behavior,
+            bar_limit,
+            y_max,
+            row_centers,
+            lane_height,
+            show_xlabel=row_index == len(STANDALONE_PAIR_SPECS) - 1,
+        )
+
+        axis_i.set_title(pair["animal_i"], fontsize=9.0, pad=1.5)
+        axis_j.set_title(pair["animal_j"], fontsize=9.0, pad=1.5)
+        axis_i.set_ylabel("")
+        axis_j.set_ylabel("")
+        axis_i.set_yticks(row_centers, MOCKUP_BEHAVIOR_LABELS, fontsize=7.4)
+        for tick, behavior in zip(axis_i.get_yticklabels(), BEHAVIOR_ORDER):
+            tick.set_color(BEHAVIOR_COLORS[behavior])
+        axis_i.tick_params(axis="y", length=0, pad=1)
+        axis_j.tick_params(axis="y", labelleft=False, length=0)
+        axis_i.grid(False, axis="x")
+        axis_j.grid(False, axis="x")
+
+        if row_index < len(STANDALONE_PAIR_SPECS) - 1:
+            axis_i.set_xticks([])
+            axis_j.set_xticks([])
+            axis_i.set_xlabel("")
+            axis_j.set_xlabel("")
+        else:
+            axis_i.set_xticks((0.0, 24.0), ("0", "24"), fontsize=8)
+            axis_j.set_xticks((0.0, 24.0), ("0", "24"), fontsize=8)
+            axis_i.set_xlabel("")
+            axis_j.set_xlabel("")
+
+        for axis in (axis_i, axis_j):
+            axis.tick_params(axis="x", length=2, labelsize=8)
+            for spine in axis.spines.values():
+                spine.set_linewidth(0.55)
+        row_axes.append((axis_i, axis_j, axis_bar))
+
+    figure.subplots_adjust(
+        top=0.94,
+        bottom=0.085,
+        left=0.16,
+        right=0.98,
+    )
+    for row_title, (axis_i, axis_j, _) in zip(row_titles, row_axes):
+        left = axis_i.get_position().x0
+        right = axis_j.get_position().x1
+        top = axis_i.get_position().y1
+        figure.text(
+            (left + right) / 2.0,
+            top + 0.012,
+            row_title,
+            ha="center",
+            va="bottom",
+            fontsize=10.0,
+        )
+
+    first_i, first_j, _ = row_axes[-1]
+    figure.text(
+        (first_i.get_position().x0 + first_j.get_position().x1) / 2.0,
+        0.028,
+        "CT (h)",
+        ha="center",
+        va="bottom",
+        fontsize=9.0,
+    )
+    figure.savefig(output_path, dpi=220)
+    plt.close(figure)
+
+
 def _format_behavior_values(
     pair: dict[str, str], pair_behavior: pd.DataFrame
 ) -> list[str]:
@@ -976,6 +1150,7 @@ def write_run_summary(
             "- pair_profile_675I_675J.png",
             "- pair_profile_675H_714G.png",
             "- pair_profile_714D_714H.png",
+            "- panel_C_representative_pairs_mockup_style.png",
             "- representative_pair_profile_data.csv",
             "- run_summary.txt",
         ]
@@ -1041,6 +1216,13 @@ def main() -> None:
             standalone_bar_limit,
             output_dir / f"pair_profile_{pair['pair_id'].replace('__', '_')}.png",
         )
+    save_mockup_panel_figure(
+        display,
+        standalone_pair_behavior,
+        relative_density_max,
+        standalone_bar_limit,
+        output_dir / "panel_C_representative_pairs_mockup_style.png",
+    )
 
     write_run_summary(
         output_dir / "run_summary.txt",
