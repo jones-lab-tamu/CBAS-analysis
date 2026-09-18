@@ -1017,13 +1017,19 @@ def save_mockup_panel_figure(
             fontsize=10.0,
         )
 
-    first_i, first_j, _ = row_axes[-1]
+    first_i, first_j, first_bar = row_axes[-1]
+    figure.canvas.draw()
+    renderer = figure.canvas.get_renderer()
+    bar_xlabel_bbox = first_bar.xaxis.get_label().get_window_extent(renderer=renderer)
+    bar_xlabel_center_y = figure.transFigure.inverted().transform(
+        (0.0, bar_xlabel_bbox.y0 + bar_xlabel_bbox.height / 2.0)
+    )[1]
     figure.text(
         (first_i.get_position().x0 + first_j.get_position().x1) / 2.0,
-        0.028,
+        bar_xlabel_center_y,
         "CT (h)",
         ha="center",
-        va="bottom",
+        va="center",
         fontsize=9.0,
     )
     figure.savefig(output_path, dpi=220)
