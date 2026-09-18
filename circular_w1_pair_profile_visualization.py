@@ -669,14 +669,6 @@ def plot_w1_bars(
     ax.grid(axis="x", color="#BBBBBB", linewidth=0.5, alpha=0.6)
     ax.set_axisbelow(True)
     ax.tick_params(axis="x", labelsize=8)
-    for y_position, value in zip(row_centers, values):
-        ax.text(
-            value + bar_limit * 0.012,
-            y_position,
-            f"{value:.6f}",
-            va="center",
-            fontsize=7,
-        )
 
 
 def save_profile_figure(
