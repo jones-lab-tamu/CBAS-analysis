@@ -39,7 +39,7 @@ GENOTYPE_COLORS = {"LacZ": "#2f6f9f", "Bmal1KO": "#c55a11"}
 GENOTYPE_MARKERS = {"LacZ": "o", "Bmal1KO": "s"}
 GROUP_DISPLAY_NAMES = {"LacZ": "LacZ", "Bmal1KO": "Bmal1 KO"}
 COMPOSITE_METADATA_FILENAME = "pairwise_repertoire_distance.csv"
-PANEL_A_OUTPUT_DIR_NAME = "Pair_Profile_Visualization"
+PANEL_OUTPUT_DIR_NAME = "Pair_Profile_Visualization"
 
 DEFAULT_INPUT_MATRIX = Path(
     r"C:\Users\Jeff\Documents\CBAS_Analysis_Data\Cohort_Data\Circular_W1_Repertoire\repertoire_distance_matrix.csv"
@@ -660,54 +660,69 @@ def distance_to_lacz_table(distances: np.ndarray) -> pd.DataFrame:
 
 
 def plot_distance_to_lacz(output_path: Path, reference_table: pd.DataFrame) -> None:
-    x_values = np.arange(len(reference_table), dtype=float)
-    y_values = reference_table["mean_distance_to_lacz_hours"].to_numpy(float)
+    if reference_table.empty:
+        raise ValueError("Distance-to-LacZ reference table is empty.")
+    required_columns = {"animal", "genotype", "mean_distance_to_lacz_hours"}
+    missing = sorted(required_columns.difference(reference_table.columns))
+    if missing:
+        raise ValueError(f"Distance-to-LacZ reference table is missing columns: {missing}")
 
-    fig, ax = plt.subplots(figsize=(9.0, 5.8))
-    for genotype in GENOTYPES:
-        indices = [
-            index
-            for index, animal in enumerate(reference_table["animal"])
-            if GENOTYPE_BY_ANIMAL[animal] == genotype
-        ]
+    observed_groups = list(dict.fromkeys(reference_table["genotype"].astype(str)))
+    group_order = [group for group in GENOTYPES if group in observed_groups]
+    group_order.extend(group for group in observed_groups if group not in group_order)
+    group_positions = {group: float(index) for index, group in enumerate(group_order)}
+
+    figure, ax = plt.subplots(figsize=(4.4, 5.1))
+    for group in group_order:
+        group_rows = reference_table[reference_table["genotype"].astype(str) == group]
+        count = len(group_rows)
+        jitter_half_width = min(
+            0.28,
+            max(0.12, 0.12 + 0.16 * min(1.0, (count - 1) / 12.0)),
+        )
+        if count == 1:
+            offsets = np.zeros(1, dtype=float)
+        else:
+            offsets = np.linspace(-jitter_half_width, jitter_half_width, count)
+        x_values = group_positions[group] + offsets
+        y_values = group_rows["mean_distance_to_lacz_hours"].to_numpy(float)
         ax.scatter(
-            x_values[indices],
-            y_values[indices],
-            s=70,
-            marker=GENOTYPE_MARKERS[genotype],
-            color=GENOTYPE_COLORS[genotype],
+            x_values,
+            y_values,
+            s=54,
+            marker="o",
+            color=GENOTYPE_COLORS.get(group, "#666666"),
             edgecolor="#222222",
-            linewidth=0.7,
-            label=genotype,
+            linewidth=0.6,
             zorder=3,
         )
 
-    for index, row in reference_table.iterrows():
-        ax.annotate(
-            row["animal"],
-            (x_values[index], y_values[index]),
-            xytext=(4, 5),
-            textcoords="offset points",
-            fontsize=9,
-        )
+    y_values = reference_table["mean_distance_to_lacz_hours"].to_numpy(float)
+    if not np.isfinite(y_values).all():
+        raise ValueError("Distance-to-LacZ reference values contain non-finite values.")
+    y_min = float(np.min(y_values))
+    y_max = float(np.max(y_values))
+    y_span = y_max - y_min
+    y_padding = max(0.05, 0.08 * y_span) if y_span > 0 else 0.1
 
-    ax.set_xlim(-0.5, len(reference_table) - 0.5)
-    ax.set_xticks(x_values, ["" for _ in x_values])
-    ax.set_ylabel("Mean distance to specified LacZ reference (hours)")
-    ax.set_title("Descriptive distance to LacZ reference")
-    ax.text(
-        0.0,
-        -0.16,
-        "LacZ: other three LacZ animals; Bmal1KO: all four LacZ animals.",
-        transform=ax.transAxes,
-        fontsize=9,
-        color="#555555",
+    ax.set_xlim(-0.45, max(0.45, len(group_order) - 0.55))
+    ax.set_ylim(y_min - y_padding, y_max + y_padding)
+    ax.set_xticks(
+        list(group_positions.values()),
+        [GROUP_DISPLAY_NAMES.get(group, group) for group in group_order],
     )
+    ax.set_ylabel(r"Distance to LacZ reference, $W_1$ (h)")
+    ax.set_title("Distance to LacZ reference", fontsize=11, pad=8)
     ax.grid(axis="y", color="#dddddd", linewidth=0.6)
-    ax.legend(frameon=False, loc="best")
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=220, bbox_inches="tight")
-    plt.close(fig)
+    ax.set_axisbelow(True)
+    ax.tick_params(axis="both", labelsize=9)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_linewidth(0.7)
+    ax.spines["bottom"].set_linewidth(0.7)
+    figure.subplots_adjust(left=0.23, right=0.96, bottom=0.16, top=0.88)
+    figure.savefig(output_path, dpi=220, bbox_inches="tight")
+    plt.close(figure)
 
 
 def validate_written_outputs(
@@ -994,16 +1009,16 @@ def run(input_path: Path, output_dir: Path) -> str:
         mst_edges=mst_edges,
     )
     plot_fidelity(output_dir / "pcoa_distance_fidelity.png", pairwise)
-    panel_a_output_dir = input_path.parent / PANEL_A_OUTPUT_DIR_NAME
-    panel_a_output_dir.mkdir(parents=True, exist_ok=True)
+    panel_output_dir = input_path.parent / PANEL_OUTPUT_DIR_NAME
+    panel_output_dir.mkdir(parents=True, exist_ok=True)
     plot_heatmap(
-        panel_a_output_dir / "panel_A_composite_circular_w1_heatmap.png",
+        panel_output_dir / "panel_A_composite_circular_w1_heatmap.png",
         matrix.loc[list(panel_a_animals), list(panel_a_animals)],
         panel_a_group_by_animal,
         panel_a_group_order,
     )
     plot_distance_to_lacz(
-        output_dir / "distance_to_lacz_reference.png", reference_table
+        panel_output_dir / "panel_B_distance_to_lacz_reference.png", reference_table
     )
 
     written_checks = validate_written_outputs(
