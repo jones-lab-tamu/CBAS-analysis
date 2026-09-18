@@ -1,8 +1,9 @@
-"""Create a classical PCoA view and fidelity diagnostics for the frozen W1 matrix.
+"""Create frozen circular-W1 visual diagnostics.
 
-This script consumes the existing 8 x 8 repertoire-distance matrix only.  It
-does not recompute behavior-level W1 distances, modify the metric, or perform
-genotype or knockdown inference.
+The script does not recompute behavior-level W1 distances, modify the metric,
+or perform genotype or knockdown inference.  The Panel A heatmap uses the
+distance matrix plus its pair metadata to order arbitrary cohort sizes by
+group while leaving the matrix values unchanged.
 """
 
 from __future__ import annotations
@@ -36,6 +37,9 @@ GENOTYPE_BY_ANIMAL = {animal: genotype for genotype, animal in ANIMALS}
 GENOTYPES = ("LacZ", "Bmal1KO")
 GENOTYPE_COLORS = {"LacZ": "#2f6f9f", "Bmal1KO": "#c55a11"}
 GENOTYPE_MARKERS = {"LacZ": "o", "Bmal1KO": "s"}
+GROUP_DISPLAY_NAMES = {"LacZ": "LacZ", "Bmal1KO": "Bmal1 KO"}
+COMPOSITE_METADATA_FILENAME = "pairwise_repertoire_distance.csv"
+PANEL_A_OUTPUT_DIR_NAME = "Pair_Profile_Visualization"
 
 DEFAULT_INPUT_MATRIX = Path(
     r"C:\Users\Jeff\Documents\CBAS_Analysis_Data\Cohort_Data\Circular_W1_Repertoire\repertoire_distance_matrix.csv"
@@ -101,6 +105,66 @@ def load_and_validate_matrix(path: Path) -> tuple[pd.DataFrame, np.ndarray, dict
         "maximum_distance": float(np.max(distances)),
     }
     return matrix, distances, checks
+
+
+def load_group_metadata(
+    path: Path, animals: tuple[str, ...]
+) -> tuple[tuple[str, ...], dict[str, str], tuple[str, ...]]:
+    """Infer group membership and display order from the frozen pair metadata."""
+
+    metadata = pd.read_csv(path)
+    required = {"animal_i", "genotype_i", "animal_j", "genotype_j"}
+    missing = sorted(required.difference(metadata.columns))
+    if missing:
+        raise ValueError(f"{path.name} is missing group metadata columns: {missing}")
+
+    group_by_animal: dict[str, str] = {}
+    group_order: list[str] = []
+    for row in metadata.itertuples(index=False):
+        for animal_column, group_column in (
+            ("animal_i", "genotype_i"),
+            ("animal_j", "genotype_j"),
+        ):
+            animal_value = getattr(row, animal_column)
+            group_value = getattr(row, group_column)
+            if pd.isna(animal_value) or pd.isna(group_value):
+                raise ValueError(f"{path.name} contains missing group metadata.")
+            animal = str(animal_value)
+            group = str(group_value)
+            previous_group = group_by_animal.setdefault(animal, group)
+            if previous_group != group:
+                raise ValueError(
+                    f"Animal {animal} has conflicting group metadata: "
+                    f"{previous_group!r} and {group!r}."
+                )
+            if group not in group_order:
+                group_order.append(group)
+
+    missing_animals = sorted(set(animals).difference(group_by_animal))
+    if missing_animals:
+        raise ValueError(
+            "Group metadata does not cover all matrix animals: "
+            + ", ".join(missing_animals)
+        )
+
+    animal_set = set(animals)
+    group_order = [
+        group
+        for group in group_order
+        if any(
+            animal in animal_set and group_by_animal[animal] == group
+            for animal in group_by_animal
+        )
+    ]
+    ordered_animals = tuple(
+        animal
+        for group in group_order
+        for animal in animals
+        if group_by_animal[animal] == group
+    )
+    if set(ordered_animals) != set(animals):
+        raise ValueError("Could not order every matrix animal by its group metadata.")
+    return ordered_animals, group_by_animal, tuple(group_order)
 
 
 def classical_pcoa(
@@ -465,61 +529,111 @@ def plot_fidelity(output_path: Path, pairwise: pd.DataFrame) -> None:
     plt.close(figure)
 
 
-def plot_heatmap(output_path: Path, distances: np.ndarray) -> None:
-    figure = plt.figure(figsize=(10.0, 7.3))
-    grid = GridSpec(1, 2, figure=figure, width_ratios=(4.5, 1.15), wspace=0.08)
-    ax = figure.add_subplot(grid[0, 0])
-    reserved_ax = figure.add_subplot(grid[0, 1])
-    reserved_ax.axis("off")
-    reserved_ax.text(
-        0.5,
-        0.5,
-        "Reserved for future\nBmal1 knockdown\nannotation",
-        ha="center",
-        va="center",
-        rotation=90,
-        color="#777777",
-        fontsize=9,
+def plot_heatmap(
+    output_path: Path,
+    matrix: pd.DataFrame,
+    group_by_animal: dict[str, str],
+    group_order: tuple[str, ...],
+) -> None:
+    """Save the cohort-scalable lower-triangle composite-W1 heatmap."""
+
+    animals = tuple(str(animal) for animal in matrix.index)
+    columns = tuple(str(animal) for animal in matrix.columns)
+    if animals != columns or len(set(animals)) != len(animals):
+        raise ValueError("The composite distance matrix must have matching unique row and column IDs.")
+    if set(animals) != set(group_by_animal):
+        raise ValueError("Group metadata and composite distance matrix cover different animals.")
+
+    ordered_animals = tuple(
+        animal
+        for group in group_order
+        for animal in animals
+        if group_by_animal[animal] == group
+    )
+    if set(ordered_animals) != set(animals):
+        raise ValueError("Could not order every matrix animal by its group metadata.")
+
+    ordered_distances = matrix.loc[list(ordered_animals), list(ordered_animals)].to_numpy(
+        dtype=float
+    )
+    if not np.isfinite(ordered_distances).all():
+        raise ValueError("Composite distance matrix contains non-finite values.")
+    if not np.allclose(ordered_distances, ordered_distances.T, atol=EIGENVALUE_TOLERANCE):
+        raise ValueError("Composite distance matrix is not symmetric.")
+
+    n_animals = len(ordered_animals)
+    display_mask = np.triu(np.ones((n_animals, n_animals), dtype=bool), k=0)
+    visible_values = ordered_distances[~display_mask]
+    if visible_values.size == 0:
+        raise ValueError("At least one unique pair is required for the composite heatmap.")
+    vmax = float(np.max(visible_values))
+    if vmax <= 0.0:
+        vmax = 1.0
+    masked_distances = np.ma.masked_where(display_mask, ordered_distances)
+
+    figure_size = max(5.8, 0.42 * n_animals + 2.3)
+    figure, ax = plt.subplots(figsize=(figure_size + 1.0, figure_size))
+    figure.subplots_adjust(left=0.17, right=0.86, bottom=0.18, top=0.82)
+    cmap = plt.get_cmap("viridis").copy()
+    cmap.set_bad(color="white")
+    image = ax.imshow(
+        masked_distances,
+        cmap=cmap,
+        vmin=0.0,
+        vmax=vmax,
+        interpolation="none",
     )
 
-    image = ax.imshow(distances, cmap="viridis", vmin=0, vmax=float(np.max(distances)))
-    for i in range(len(ANIMAL_ORDER)):
-        for j in range(len(ANIMAL_ORDER)):
-            text_color = "white" if distances[i, j] > np.max(distances) * 0.52 else "black"
-            ax.text(
-                j,
-                i,
-                f"{distances[i, j]:.2f}",
-                ha="center",
-                va="center",
-                color=text_color,
-                fontsize=8,
-            )
-
-    ax.set_xticks(range(len(ANIMAL_ORDER)), ANIMAL_ORDER, rotation=45, ha="right")
-    ax.set_yticks(range(len(ANIMAL_ORDER)), ANIMAL_ORDER)
-    ax.set_xlabel("Animal")
-    ax.set_ylabel("Animal")
-    ax.set_title("Exact circular-W1 repertoire distance (hours)")
-    ax.axhline(3.5, color="white", linewidth=2.0)
-    ax.axvline(3.5, color="white", linewidth=2.0)
-    ax.text(0.25, 1.04, "LacZ", transform=ax.transAxes, ha="center", va="bottom", fontsize=10)
-    ax.text(
-        0.75,
-        1.04,
-        "Bmal1KO",
-        transform=ax.transAxes,
-        ha="center",
-        va="bottom",
-        fontsize=10,
+    tick_fontsize = max(7.0, min(10.0, 80.0 / max(n_animals, 1)))
+    positions = np.arange(n_animals)
+    ax.set_xticks(
+        positions,
+        ordered_animals,
+        rotation=45,
+        ha="right",
+        rotation_mode="anchor",
+        fontsize=tick_fontsize,
     )
-    for tick, animal in zip(ax.get_xticklabels(), ANIMAL_ORDER):
-        tick.set_color(GENOTYPE_COLORS[GENOTYPE_BY_ANIMAL[animal]])
-    for tick, animal in zip(ax.get_yticklabels(), ANIMAL_ORDER):
-        tick.set_color(GENOTYPE_COLORS[GENOTYPE_BY_ANIMAL[animal]])
+    ax.set_yticks(positions, ordered_animals, fontsize=tick_fontsize)
+    ax.tick_params(axis="both", length=3, pad=3)
+    ax.set_xlim(-0.5, n_animals - 0.5)
+    ax.set_ylim(n_animals - 0.5, -0.5)
 
+    cumulative = 0
+    for group in group_order:
+        group_animals = [animal for animal in ordered_animals if group_by_animal[animal] == group]
+        if not group_animals:
+            continue
+        start = cumulative
+        end = cumulative + len(group_animals) - 1
+        center = (start + end) / 2.0
+        group_color = GENOTYPE_COLORS.get(group, "#444444")
+        group_label = GROUP_DISPLAY_NAMES.get(group, group)
+        ax.text(
+            center,
+            1.015,
+            group_label,
+            transform=ax.get_xaxis_transform(),
+            ha="center",
+            va="bottom",
+            fontsize=max(8.0, tick_fontsize),
+            color=group_color,
+        )
+        cumulative += len(group_animals)
+        if cumulative < n_animals:
+            boundary = cumulative - 0.5
+            ax.axhline(boundary, color="#8c8c8c", linewidth=0.7, alpha=0.65, zorder=3)
+            ax.axvline(boundary, color="#8c8c8c", linewidth=0.7, alpha=0.65, zorder=3)
+
+    for tick, animal in zip(ax.get_xticklabels(), ordered_animals):
+        tick.set_color(GENOTYPE_COLORS.get(group_by_animal[animal], "#333333"))
+    for tick, animal in zip(ax.get_yticklabels(), ordered_animals):
+        tick.set_color(GENOTYPE_COLORS.get(group_by_animal[animal], "#333333"))
+
+    ax.set_title(r"Composite circular $W_1$ distance", fontsize=13, pad=24)
     colorbar = figure.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
-    colorbar.set_label("Distance (hours)")
+    colorbar.set_label(r"Composite $W_1$ (h)", labelpad=8)
+    colorbar.ax.tick_params(labelsize=max(7.0, tick_fontsize - 0.5))
     figure.savefig(output_path, dpi=220, bbox_inches="tight")
     plt.close(figure)
 
@@ -835,6 +949,10 @@ def write_validation_summary(
 
 def run(input_path: Path, output_dir: Path) -> str:
     matrix, distances, matrix_checks = load_and_validate_matrix(input_path)
+    panel_a_animals, panel_a_group_by_animal, panel_a_group_order = load_group_metadata(
+        input_path.parent / COMPOSITE_METADATA_FILENAME,
+        tuple(str(animal) for animal in matrix.index),
+    )
     pcoa = classical_pcoa(distances)
     positive_coordinates = np.asarray(pcoa["positive_coordinates"], dtype=float)
     two_dimensional_coordinates = positive_coordinates[:, :2]
@@ -876,7 +994,14 @@ def run(input_path: Path, output_dir: Path) -> str:
         mst_edges=mst_edges,
     )
     plot_fidelity(output_dir / "pcoa_distance_fidelity.png", pairwise)
-    plot_heatmap(output_dir / "repertoire_distance_heatmap_annotated.png", distances)
+    panel_a_output_dir = input_path.parent / PANEL_A_OUTPUT_DIR_NAME
+    panel_a_output_dir.mkdir(parents=True, exist_ok=True)
+    plot_heatmap(
+        panel_a_output_dir / "panel_A_composite_circular_w1_heatmap.png",
+        matrix.loc[list(panel_a_animals), list(panel_a_animals)],
+        panel_a_group_by_animal,
+        panel_a_group_order,
+    )
     plot_distance_to_lacz(
         output_dir / "distance_to_lacz_reference.png", reference_table
     )
