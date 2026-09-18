@@ -1,4 +1,4 @@
-"""Create stacked filled phase-distribution profiles for two frozen W1 pairs.
+"""Create stacked filled phase-distribution profiles for frozen W1 pairs.
 
 This standalone presentation/QC script reads the existing 5-minute phase
 distributions and pairwise circular-W1 outputs.  It does not rerun any
@@ -54,6 +54,22 @@ PAIR_SPECS = (
         "animal_j": "714H",
         "class_label": "high composite distance",
     },
+)
+
+STANDALONE_PAIR_SPECS = (
+    {
+        "pair_id": "675I__675J",
+        "animal_i": "675I",
+        "animal_j": "675J",
+        "class_label": "low composite distance",
+    },
+    {
+        "pair_id": "675H__714G",
+        "animal_i": "675H",
+        "animal_j": "714G",
+        "class_label": "medium composite distance",
+    },
+    PAIR_SPECS[1],
 )
 
 BEHAVIOR_COLORS = {
@@ -295,7 +311,7 @@ def validate_sources(
     if max_composite_mean_error > PROBABILITY_TOLERANCE:
         raise ValueError("Composite W1 is not the arithmetic mean of its eight components.")
 
-    for pair in PAIR_SPECS:
+    for pair in STANDALONE_PAIR_SPECS:
         pair_key = (pair["animal_i"], pair["animal_j"])
         if pair_key not in composite_lookup:
             raise ValueError(f"Selected pair is missing from composite output: {pair_key}")
@@ -414,14 +430,17 @@ def selected_profile_data(display: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def selected_w1_table(validation: dict[str, object]) -> pd.DataFrame:
+def selected_w1_table(
+    validation: dict[str, object],
+    pair_specs: tuple[dict[str, str], ...] = PAIR_SPECS,
+) -> pd.DataFrame:
     pairwise_lookup = validation["pairwise_lookup"]
     composite_lookup = validation["composite_lookup"]
     assert isinstance(pairwise_lookup, dict)
     assert isinstance(composite_lookup, dict)
 
     rows: list[dict[str, object]] = []
-    for pair in PAIR_SPECS:
+    for pair in pair_specs:
         composite_value = float(
             getattr(
                 composite_lookup[(pair["animal_i"], pair["animal_j"])],
@@ -773,6 +792,78 @@ def save_profile_figure(
     plt.close(figure)
 
 
+def save_standalone_pair_figure(
+    display: pd.DataFrame,
+    pair_behavior: pd.DataFrame,
+    pair: dict[str, str],
+    relative_density_max: float,
+    bar_limit: float,
+    output_path: Path,
+) -> None:
+    """Save one compact connected-profile figure for one fixed pair."""
+
+    figure = plt.figure(figsize=(12.0, 6.8))
+    grid = plt.GridSpec(
+        1,
+        3,
+        figure=figure,
+        width_ratios=(1.0, 1.0, 0.78),
+        wspace=0.38,
+    )
+    lane_height, y_max, _, row_centers = lane_layout(relative_density_max)
+    axis_i = figure.add_subplot(grid[0, 0])
+    axis_j = figure.add_subplot(grid[0, 1])
+    axis_bar = figure.add_subplot(grid[0, 2])
+    plot_profile_axis(
+        axis_i,
+        display,
+        pair["animal_i"],
+        relative_density_max,
+        style="connected",
+        wrap_margin=False,
+    )
+    plot_profile_axis(
+        axis_j,
+        display,
+        pair["animal_j"],
+        relative_density_max,
+        style="connected",
+        wrap_margin=False,
+    )
+    plot_w1_bars(
+        axis_bar,
+        pair,
+        pair_behavior,
+        bar_limit,
+        y_max,
+        row_centers,
+        lane_height,
+    )
+    axis_i.set_ylabel("behavior lanes\n(relative density height)", fontsize=8)
+    axis_j.set_ylabel("")
+    axis_bar.set_ylabel("")
+
+    figure.suptitle(
+        f"{pair['animal_i']} vs {pair['animal_j']} connected phase profiles\n"
+        "30-minute connected values; common relative-density scale across all three pairs",
+        fontsize=12.5,
+        y=0.98,
+    )
+    figure.text(
+        0.5,
+        0.018,
+        "Circular W1 uses the original 5-minute distributions; 30-minute aggregation is display-only. "
+        "Dashed lines mark 1× uniform; connected segments are straight, with no smoothing.",
+        ha="center",
+        va="bottom",
+        fontsize=8,
+        color="#444444",
+    )
+    figure.subplots_adjust(top=0.86, bottom=0.10, left=0.11, right=0.97)
+    figure.savefig(output_path, dpi=220)
+    plt.close(figure)
+
+
 def _format_behavior_values(
     pair: dict[str, str], pair_behavior: pd.DataFrame
 ) -> list[str]:
@@ -792,6 +883,8 @@ def write_run_summary(
     validation: dict[str, object],
     display_stats: dict[str, float | int],
     pair_behavior: pd.DataFrame,
+    standalone_pair_behavior: pd.DataFrame,
+    standalone_bar_limit: float,
 ) -> None:
     composite_lookup = validation["composite_lookup"]
     assert isinstance(composite_lookup, dict)
@@ -814,7 +907,7 @@ def write_run_summary(
         "- The same quantitative lane scale is used for all behaviors, animals, and representative pairs.",
         "- Filled step profiles preserve the 30-minute bin edges; connected profiles join adjacent 30-minute bin centers with straight lines and do not fit curves.",
         "",
-        "Representative pairs and exact composite W1:",
+        "Existing combined-prototype pairs and exact composite W1:",
     ]
     for pair in PAIR_SPECS:
         composite_value = float(
@@ -826,10 +919,21 @@ def write_run_summary(
         lines.append(
             f"- {pair['pair_id']} ({pair['class_label']}): {composite_value:.17g} h"
         )
-    lines.extend(["", "Exact behavior-specific W1 values:"])
+    lines.extend(["", "Existing combined-prototype behavior-specific W1 values:"])
     for pair in PAIR_SPECS:
         lines.append(f"- {pair['pair_id']}:")
         lines.extend(_format_behavior_values(pair, pair_behavior))
+
+    lines.extend(["", "Standalone pair figures:"])
+    for pair in STANDALONE_PAIR_SPECS:
+        subset = standalone_pair_behavior[
+            standalone_pair_behavior["pair_id"] == pair["pair_id"]
+        ]
+        composite_value = float(subset["composite_repertoire_w1_hours"].iloc[0])
+        lines.append(
+            f"- {pair['pair_id']} ({pair['class_label']}): {composite_value:.17g} h"
+        )
+        lines.extend(_format_behavior_values(pair, standalone_pair_behavior))
 
     lines.extend(
         [
@@ -840,6 +944,14 @@ def write_run_summary(
             f"- cells clipped: 0 of {total_display_cells} (0.0%)",
             f"- maximum aggregation-versus-5-minute mass error: {float(display_stats['max_aggregation_error']):.3g}",
             f"- maximum 30-minute row-sum error: {float(display_stats['max_display_sum_error']):.3g}",
+            f"- common W1-bar x-axis limit across all three standalone pairs: {standalone_bar_limit:.6f} h",
+            "",
+            "Low / medium / high review:",
+            "- The 675I__675J low pair is broadly similar across the behavior lanes; its largest contributions are nesting and digging, but neither is an isolated visual outlier.",
+            "- 675H__714G shows moderate differences distributed across nesting, locomotion, climbing, drinking, and eating; nesting is the largest contributor, but the pattern is mixed rather than a single-row change.",
+            "- The medium pair shows mixed behavior-specific phase and shape redistribution rather than one common phase shift or one isolated outlier, and remains a good intermediate example.",
+            "- The 714D__714H high pair shows broad multibehavior redistribution; several behavior rows contribute strongly, so no single behavior explains the high composite.",
+            "- The three standalone figures form a visually sensible low-to-medium-to-high progression, and all six animals are unique across the three pairs.",
             "",
             "Profile versus heatmap interpretation:",
             "- The compact connected CT0–24 profile is easier for scanning peak locations, shoulders, broad shape, and multimodality than the prior horizontally stretched figure.",
@@ -869,6 +981,9 @@ def write_run_summary(
             "- representative_pair_profiles_step_wrap.png",
             "- representative_pair_profiles_connected_wrap.png",
             "- representative_pair_profiles_connected_compact.png",
+            "- pair_profile_675I_675J.png",
+            "- pair_profile_675H_714G.png",
+            "- pair_profile_714D_714H.png",
             "- representative_pair_profile_data.csv",
             "- run_summary.txt",
         ]
@@ -886,6 +1001,10 @@ def main() -> None:
     display, display_stats = aggregate_to_30_minutes(phase)
     profile_data = selected_profile_data(display)
     pair_behavior = selected_w1_table(validation)
+    standalone_pair_behavior = selected_w1_table(validation, STANDALONE_PAIR_SPECS)
+    standalone_bar_limit = (
+        float(standalone_pair_behavior["behavior_w1_hours"].max()) * 1.22
+    )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     profile_data.to_csv(
@@ -921,6 +1040,16 @@ def main() -> None:
         compact_geometry=True,
     )
 
+    for pair in STANDALONE_PAIR_SPECS:
+        save_standalone_pair_figure(
+            display,
+            standalone_pair_behavior,
+            pair,
+            relative_density_max,
+            standalone_bar_limit,
+            output_dir / f"pair_profile_{pair['pair_id'].replace('__', '_')}.png",
+        )
+
     write_run_summary(
         output_dir / "run_summary.txt",
         input_dir,
@@ -928,6 +1057,8 @@ def main() -> None:
         validation,
         display_stats,
         pair_behavior,
+        standalone_pair_behavior,
+        standalone_bar_limit,
     )
 
     print(f"Wrote profile outputs to {output_dir}")
@@ -938,6 +1069,14 @@ def main() -> None:
             ].iloc[0]
         )
         print(f"{pair['pair_id']}: composite_w1={composite_value:.6f} h")
+    for pair in STANDALONE_PAIR_SPECS:
+        composite_value = float(
+            standalone_pair_behavior[
+                standalone_pair_behavior["pair_id"] == pair["pair_id"]
+            ]["composite_repertoire_w1_hours"].iloc[0]
+        )
+        print(f"{pair['pair_id']}: composite_w1={composite_value:.6f} h")
+    print(f"standalone_w1_bar_limit={standalone_bar_limit:.6f} h")
     print(
         "relative_density_range="
         f"{float(display_stats['relative_density_min']):.6f}-"
