@@ -21,7 +21,7 @@ import pandas as pd
 import phase_behavior_mutual_information as frozen_phase
 
 
-ANIMALS = (
+PILOT_ANIMALS = (
     ("LacZ", "675G"),
     ("LacZ", "675H"),
     ("LacZ", "675I"),
@@ -31,8 +31,6 @@ ANIMALS = (
     ("Bmal1KO", "714G"),
     ("Bmal1KO", "714H"),
 )
-ANIMAL_ORDER = tuple(animal for _, animal in ANIMALS)
-GENOTYPE_BY_ANIMAL = {animal: genotype for genotype, animal in ANIMALS}
 NONREST_BEHAVIORS = tuple(
     frozen_phase.BEHAVIORS[index]
     for index in frozen_phase.NONRESTING_BEHAVIOR_INDICES
@@ -46,7 +44,6 @@ N_CYCLES = 4
 N_CT_BINS = 288
 CT_HOURS = frozen_phase.CT_HOURS
 CT_BIN_WIDTH_HOURS = CT_HOURS / N_CT_BINS
-RECORDING_START_CT = 18.0
 OUTPUT_DIRNAME = "Circular_W1_Repertoire"
 W1_TOLERANCE_HOURS = 1e-12
 PROBABILITY_TOLERANCE = 1e-12
@@ -97,14 +94,75 @@ DECOMPOSITION_COLUMNS = [
 ]
 
 
-def parse_args() -> Path:
-    parser = argparse.ArgumentParser(description=__doc__)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Compute the equal-weight circular-W1 repertoire distance for a cohort."
+    )
     parser.add_argument(
         "cohort_root",
         type=Path,
-        help="Cohort_Data directory containing the eight frozen pilot animals.",
+        help="Cohort data directory containing group/animal folders.",
     )
-    return parser.parse_args().cohort_root.expanduser().resolve()
+    parser.add_argument(
+        "--metadata",
+        type=Path,
+        default=None,
+        help=(
+            "Optional CSV containing at least animal and group columns; "
+            "display_order is optional. Without it, the eight-animal pilot is used."
+        ),
+    )
+    args = parser.parse_args()
+    args.cohort_root = args.cohort_root.expanduser().resolve()
+    if args.metadata is not None:
+        args.metadata = args.metadata.expanduser().resolve()
+    return args
+
+
+def _load_cohort_animals(metadata_path: Path | None) -> list[tuple[str, str]]:
+    """Return (group, animal) pairs in the requested deterministic order."""
+
+    if metadata_path is None:
+        return list(PILOT_ANIMALS)
+
+    metadata = pd.read_csv(metadata_path, dtype=str, keep_default_na=False)
+    required_columns = {"animal", "group"}
+    missing_columns = sorted(required_columns.difference(metadata.columns))
+    if missing_columns:
+        raise ValueError(
+            f"Metadata is missing required columns: {missing_columns}"
+        )
+    if metadata.empty:
+        raise ValueError("Metadata must contain at least two animals.")
+    metadata = metadata.copy()
+    metadata["animal"] = metadata["animal"].str.strip()
+    metadata["group"] = metadata["group"].str.strip()
+    if metadata["animal"].eq("").any():
+        raise ValueError("Metadata animal values must be non-empty.")
+    if metadata["group"].eq("").any():
+        raise ValueError("Metadata group values must be non-empty.")
+    if metadata["animal"].duplicated().any():
+        duplicates = sorted(
+            metadata.loc[metadata["animal"].duplicated(keep=False), "animal"].unique()
+        )
+        raise ValueError(f"Metadata contains duplicate animal rows: {duplicates}")
+    if len(metadata) < 2:
+        raise ValueError("Metadata must contain at least two animals.")
+
+    if "display_order" in metadata.columns:
+        display_order = pd.to_numeric(metadata["display_order"], errors="coerce")
+        if display_order.isna().any() or not np.isfinite(
+            display_order.astype(float).to_numpy()
+        ).all():
+            raise ValueError("Metadata display_order must be numeric and finite.")
+        metadata["_display_order"] = display_order
+        metadata["_metadata_row"] = np.arange(len(metadata))
+        metadata = metadata.sort_values(
+            ["_display_order", "_metadata_row"],
+            kind="stable",
+        )
+
+    return list(zip(metadata["group"].tolist(), metadata["animal"].tolist()))
 
 
 def circular_w1(
@@ -327,24 +385,9 @@ def assign_ct_bins(
     cycle_times: np.ndarray,
     *,
     frp_hours: float,
-    start_ct: float = RECORDING_START_CT,
 ) -> np.ndarray:
-    """Assign CT bins within a frozen CT0-to-CT24 cycle.
+    """Assign CT bins relative to each frozen CT0-to-CT24 cycle boundary."""
 
-    The frozen cycle boundaries are defined by the established mapping
-    ``start_CT / 24 + t / T``.  Once a frame is selected inside one of those
-    CT0-to-CT24 intervals, subtracting that frozen CT0 boundary and mapping
-    ``24 * cycle_time / T`` is mathematically identical and preserves the
-    exact floating-point behavior used by the prior phase audit.
-    """
-
-    if not np.isclose(
-        start_ct,
-        RECORDING_START_CT,
-        rtol=0.0,
-        atol=1e-12,
-    ):
-        raise ValueError(f"Unexpected CT anchor: {start_ct}")
     phase_ct_hours = np.mod(CT_HOURS * cycle_times / frp_hours, CT_HOURS)
     safe_phase = np.minimum(
         phase_ct_hours,
@@ -386,6 +429,16 @@ def _build_animal_phase_data(
         raise FileNotFoundError(f"Missing animal directory: {animal_dir}")
 
     input_files, missing_indices = frozen_phase.discover_input_files(animal_dir)
+    source_animals: set[str] = set()
+    for _, path in input_files:
+        match = frozen_phase.INPUT_FILENAME_PATTERN.fullmatch(path.name)
+        if match is not None:
+            source_animals.add(match.group("animal"))
+    if source_animals != {animal}:
+        raise ValueError(
+            f"Source-file animal prefix for {animal} does not match its folder/metadata ID: "
+            f"{sorted(source_animals)}"
+        )
     if missing_indices:
         raise ValueError(
             f"{animal} has missing source-file indices: {missing_indices}"
@@ -402,17 +455,6 @@ def _build_animal_phase_data(
             f"Expected {N_CYCLES} frozen complete cycles for {animal}, "
             f"found {len(complete_cycles)}"
         )
-    if not np.isclose(
-        start_ct,
-        RECORDING_START_CT,
-        rtol=0.0,
-        atol=1e-12,
-    ):
-        raise ValueError(
-            f"Frozen CT anchor for {animal} is {start_ct}, "
-            f"expected {RECORDING_START_CT}"
-        )
-
     elapsed_hours, labels, weights_seconds, invalid_rows = (
         _load_classified_samples(input_files)
     )
@@ -441,7 +483,6 @@ def _build_animal_phase_data(
         ct_bins = assign_ct_bins(
             cycle_times,
             frp_hours=computational_frp_hours,
-            start_ct=start_ct,
         )
         if np.any(cycle_position < cycle_index - cycle_tolerance) or np.any(
             cycle_position > cycle_index + 1.0 + cycle_tolerance
@@ -532,11 +573,12 @@ def _pairwise_outputs(
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, np.ndarray], np.ndarray]:
     pairwise_rows: list[dict[str, object]] = []
     composite_rows: list[dict[str, object]] = []
+    n_animals = len(animal_data)
     behavior_matrices = {
-        behavior: np.zeros((len(ANIMALS), len(ANIMALS)), dtype=float)
+        behavior: np.zeros((n_animals, n_animals), dtype=float)
         for behavior in NONREST_BEHAVIORS
     }
-    composite_matrix = np.zeros((len(ANIMALS), len(ANIMALS)), dtype=float)
+    composite_matrix = np.zeros((n_animals, n_animals), dtype=float)
 
     for i in range(len(animal_data)):
         first = animal_data[i]
@@ -588,6 +630,7 @@ def _pairwise_outputs(
 
 
 def _validate_real_outputs(
+    animal_order: tuple[str, ...],
     animal_data: list[dict[str, object]],
     distribution_frame: pd.DataFrame,
     pairwise_frame: pd.DataFrame,
@@ -595,11 +638,22 @@ def _validate_real_outputs(
     behavior_matrices: dict[str, np.ndarray],
     composite_matrix: np.ndarray,
 ) -> None:
-    if len(animal_data) != 8 or tuple(record["animal"] for record in animal_data) != ANIMAL_ORDER:
-        raise RuntimeError("Real-data output does not contain the fixed eight animals")
+    n_animals = len(animal_order)
+    if n_animals < 2:
+        raise RuntimeError("Real-data output requires at least two animals")
+    if (
+        len(animal_data) != n_animals
+        or tuple(record["animal"] for record in animal_data) != animal_order
+    ):
+        raise RuntimeError("Real-data output does not match metadata animal order")
     if len(NONREST_BEHAVIORS) != 8:
         raise RuntimeError("The non-rest behavior set is not exactly eight states")
-    if len(distribution_frame) != 8 * 8 * N_CT_BINS:
+    expected_distribution_cells = {
+        (animal, behavior)
+        for animal in animal_order
+        for behavior in NONREST_BEHAVIORS
+    }
+    if len(distribution_frame) != n_animals * len(NONREST_BEHAVIORS) * N_CT_BINS:
         raise RuntimeError(
             f"Unexpected distribution row count: {len(distribution_frame)}"
         )
@@ -607,7 +661,11 @@ def _validate_real_outputs(
         ["animal", "behavior"],
         sort=False,
     )
-    if len(grouped) != 64 or any(len(group) != N_CT_BINS for _, group in grouped):
+    actual_distribution_cells = set(grouped.groups)
+    if (
+        actual_distribution_cells != expected_distribution_cells
+        or any(len(group) != N_CT_BINS for _, group in grouped)
+    ):
         raise RuntimeError("Distribution output does not have 288 bins per cell")
     for (animal, behavior), group in grouped:
         probability = group["probability"].to_numpy(dtype=float)
@@ -616,14 +674,15 @@ def _validate_real_outputs(
         if not np.isfinite(occupancy).all() or np.any(occupancy < 0.0):
             raise RuntimeError(f"Invalid occupancy in CSV {animal} {behavior}")
 
-    if len(pairwise_frame) != 28 * 8:
+    n_pairs = n_animals * (n_animals - 1) // 2
+    if len(pairwise_frame) != n_pairs * len(NONREST_BEHAVIORS):
         raise RuntimeError(
             f"Unexpected behavior-specific pair row count: {len(pairwise_frame)}"
         )
     expected_pairs = {
-        (ANIMAL_ORDER[i], ANIMAL_ORDER[j], behavior)
-        for i in range(len(ANIMAL_ORDER))
-        for j in range(i + 1, len(ANIMAL_ORDER))
+        (animal_order[i], animal_order[j], behavior)
+        for i in range(n_animals)
+        for j in range(i + 1, n_animals)
         for behavior in NONREST_BEHAVIORS
     }
     actual_pairs = set(
@@ -638,7 +697,7 @@ def _validate_real_outputs(
     if not np.isfinite(pairwise_frame["w1_hours"].to_numpy(dtype=float)).all():
         raise RuntimeError("Behavior-specific W1 output contains non-finite values")
 
-    if len(composite_frame) != 28:
+    if len(composite_frame) != n_pairs:
         raise RuntimeError(
             f"Unexpected composite pair row count: {len(composite_frame)}"
         )
@@ -647,9 +706,9 @@ def _validate_real_outputs(
         for row in composite_frame.itertuples(index=False)
     }
     expected_composite_keys = {
-        (ANIMAL_ORDER[i], ANIMAL_ORDER[j])
-        for i in range(len(ANIMAL_ORDER))
-        for j in range(i + 1, len(ANIMAL_ORDER))
+        (animal_order[i], animal_order[j])
+        for i in range(n_animals)
+        for j in range(i + 1, n_animals)
     }
     if composite_pair_keys != expected_composite_keys:
         raise RuntimeError("Composite output has missing or extra animal pairs")
@@ -674,6 +733,10 @@ def _validate_real_outputs(
             )
 
     for behavior, matrix in behavior_matrices.items():
+        if matrix.shape != (n_animals, n_animals):
+            raise RuntimeError(
+                f"Behavior-specific matrix has an unexpected shape: {behavior}"
+            )
         if not np.allclose(
             matrix,
             matrix.T,
@@ -688,6 +751,8 @@ def _validate_real_outputs(
             atol=W1_TOLERANCE_HOURS,
         ):
             raise RuntimeError(f"Behavior-specific matrix diagonal is nonzero: {behavior}")
+    if composite_matrix.shape != (n_animals, n_animals):
+        raise RuntimeError("Composite distance matrix has an unexpected shape")
     if not np.allclose(
         composite_matrix,
         composite_matrix.T,
@@ -735,6 +800,7 @@ def _decomposition_frame(
 
 def _save_figures(
     output_dir: Path,
+    animal_order: tuple[str, ...],
     animal_data: list[dict[str, object]],
     pairwise_frame: pd.DataFrame,
     composite_matrix: np.ndarray,
@@ -753,9 +819,9 @@ def _save_figures(
     )
     pair_matrix = pair_matrix.loc[
         [
-            (ANIMAL_ORDER[i], ANIMAL_ORDER[j])
-            for i in range(len(ANIMAL_ORDER))
-            for j in range(i + 1, len(ANIMAL_ORDER))
+            (animal_order[i], animal_order[j])
+            for i in range(len(animal_order))
+            for j in range(i + 1, len(animal_order))
         ],
         list(NONREST_BEHAVIORS),
     ]
@@ -781,12 +847,12 @@ def _save_figures(
     axis.set_title("Composite repertoire circular W1")
     axis.set_xlabel("Animal")
     axis.set_ylabel("Animal")
-    axis.set_xticks(np.arange(len(ANIMAL_ORDER)))
-    axis.set_xticklabels(ANIMAL_ORDER, rotation=45, ha="right")
-    axis.set_yticks(np.arange(len(ANIMAL_ORDER)))
-    axis.set_yticklabels(ANIMAL_ORDER)
-    for row in range(len(ANIMAL_ORDER)):
-        for column in range(len(ANIMAL_ORDER)):
+    axis.set_xticks(np.arange(len(animal_order)))
+    axis.set_xticklabels(animal_order, rotation=45, ha="right")
+    axis.set_yticks(np.arange(len(animal_order)))
+    axis.set_yticklabels(animal_order)
+    for row in range(len(animal_order)):
+        for column in range(len(animal_order)):
             axis.text(
                 column,
                 row,
@@ -847,18 +913,20 @@ def _save_figures(
 def _write_matrix_long(
     output_path: Path,
     behavior_matrices: dict[str, np.ndarray],
+    animal_order: tuple[str, ...],
+    group_by_animal: dict[str, str],
 ) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for behavior in NONREST_BEHAVIORS:
         matrix = behavior_matrices[behavior]
-        for i, animal_i in enumerate(ANIMAL_ORDER):
-            for j, animal_j in enumerate(ANIMAL_ORDER):
+        for i, animal_i in enumerate(animal_order):
+            for j, animal_j in enumerate(animal_order):
                 rows.append(
                     {
                         "animal_i": animal_i,
-                        "genotype_i": GENOTYPE_BY_ANIMAL[animal_i],
+                        "genotype_i": group_by_animal[animal_i],
                         "animal_j": animal_j,
-                        "genotype_j": GENOTYPE_BY_ANIMAL[animal_j],
+                        "genotype_j": group_by_animal[animal_j],
                         "behavior": behavior,
                         "w1_hours": float(matrix[i, j]),
                     }
@@ -902,7 +970,7 @@ def _write_validation_summary(
         "  representation: WTA",
         "  behaviors: " + ", ".join(NONREST_BEHAVIORS),
         f"  CT bins: {N_CT_BINS} bins at {CT_BIN_WIDTH_HOURS:.17g} hours",
-        f"  external recording anchor: CT{RECORDING_START_CT:g}",
+        "  phase anchor: frozen per-animal start_CT values from FRP_Phase_Output",
         "  cycles: four frozen complete CT0-to-CT24 cycles per animal",
         "  genotype statistics: not performed",
         "",
@@ -942,7 +1010,7 @@ def _write_validation_summary(
     lines.extend(
         [
             "",
-            "Descriptive W1 results across 28 unordered animal pairs:",
+            f"Descriptive W1 results across {len(composite_frame)} unordered animal pairs:",
             f"  behavior-specific range: {pairwise_values.min():.6g} to {pairwise_values.max():.6g} h",
             f"  composite repertoire range: {composite_values.min():.6g} to {composite_values.max():.6g} h",
             f"  behavior with largest mean W1: {decomposition_frame.loc[decomposition_frame['mean_w1_hours'].idxmax(), 'behavior']}",
@@ -960,11 +1028,17 @@ def _write_validation_summary(
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def run_analysis(cohort_root: Path) -> dict[str, object]:
+def run_analysis(
+    cohort_root: Path,
+    metadata_path: Path | None = None,
+) -> dict[str, object]:
     synthetic_checks = run_synthetic_validation()
+    animals = _load_cohort_animals(metadata_path)
+    animal_order = tuple(animal for _, animal in animals)
+    group_by_animal = {animal: group for group, animal in animals}
     animal_data = [
         _build_animal_phase_data(genotype, animal, cohort_root)
-        for genotype, animal in ANIMALS
+        for genotype, animal in animals
     ]
     distribution_frame = pd.DataFrame(
         _distribution_rows(animal_data),
@@ -977,6 +1051,7 @@ def run_analysis(cohort_root: Path) -> dict[str, object]:
         composite_matrix,
     ) = _pairwise_outputs(animal_data)
     _validate_real_outputs(
+        animal_order,
         animal_data,
         distribution_frame,
         pairwise_frame,
@@ -1013,12 +1088,17 @@ def run_analysis(cohort_root: Path) -> dict[str, object]:
     )
     matrix_frame = pd.DataFrame(
         composite_matrix,
-        index=ANIMAL_ORDER,
-        columns=ANIMAL_ORDER,
+        index=animal_order,
+        columns=animal_order,
     )
     matrix_frame.index.name = "animal"
     matrix_frame.to_csv(matrix_path, float_format="%.17g")
-    matrix_long_frame = _write_matrix_long(matrix_long_path, behavior_matrices)
+    matrix_long_frame = _write_matrix_long(
+        matrix_long_path,
+        behavior_matrices,
+        animal_order,
+        group_by_animal,
+    )
     decomposition_frame.to_csv(
         decomposition_path,
         index=False,
@@ -1026,6 +1106,7 @@ def run_analysis(cohort_root: Path) -> dict[str, object]:
     )
     figure_paths = _save_figures(
         output_dir,
+        animal_order,
         animal_data,
         pairwise_frame,
         composite_matrix,
@@ -1098,8 +1179,8 @@ def run_analysis(cohort_root: Path) -> dict[str, object]:
 
 
 def main() -> None:
-    cohort_root = parse_args()
-    run_analysis(cohort_root)
+    args = parse_args()
+    run_analysis(args.cohort_root, args.metadata)
 
 
 if __name__ == "__main__":
