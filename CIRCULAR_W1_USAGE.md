@@ -32,6 +32,16 @@ python circular_w1_repertoire_figure.py --input-dir "C:\path\to\Cohort_Data\Circ
 The figure's group flags must match the metadata labels. The figure generator
 currently requires exactly two selected groups; the analysis script does not.
 
+## GUI workflow
+
+Run `python circular_w1_launcher.py`, choose the cohort root, confirm the
+detected animals and folder-derived group labels, then select **Check Inputs**.
+Group and animal names are read-only and come from the immediate
+`<cohort_root>/<group>/<animal>` folder structure. Select **Run Circular W1
+Analysis** to create/update `cohort_metadata.csv` and run the existing analysis;
+then choose the control and experimental groups and select **Generate Circular
+W1 Figure**.
+
 ## Input layout
 
 `cohort_root` contains one immediate directory per group, then one immediate
